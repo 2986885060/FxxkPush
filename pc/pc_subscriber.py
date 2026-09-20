@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""FuckPush PC subscriber — receive ntfy messages, pop Windows toasts.
+
+Subscribes (SSE/JSON stream) to the VPS ntfy server and shows a toast
+for every message. Console log mirrors everything.
+
+Usage:
+    python pc_subscriber.py            # foreground
+    python pc_subscriber.py --test     # send self-test push then subscribe
+"""
+import json
+import os
+import sys
+import time
+import datetime
+from pathlib import Path
+
+import httpx
+
+# ---------- config ----------
+NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://185.170.211.73:2586")
+_SECRET = Path(__file__).parent / "ntfy.secret"
+NTFY_TOKEN = os.environ.get("FP_NTFY_TOKEN") or (_SECRET.read_text().strip() if _SECRET.exists() else "")
+TOPICS = ["fp-vps", "fp-gray"]  # VPS hard alerts + gray-zone events
+LOG_PATH = None  # set in main
+
+def log(msg):
+    line = f"[{datetime.datetime.now():%H:%M:%S}] {msg}"
+    print(line, flush=True)
+    if LOG_PATH:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+# ---------- toast ----------
+_toaster = None
+
+def get_toaster():
+    global _toaster
+    if _toaster is None:
+        from winotify import Notification
+        _toaster = Notification
+    return _toaster
+
+def toast(title, message, priority=3):
+    try:
+        from winotify import Notification, audio
+        n = Notification(app_id="FuckPush",
+                         title=title or "FuckPush",
+                         msg=message or "")
+        if priority >= 4:
+            n.set_audio(audio.LoopingAlarm, loop=False)
+        elif priority == 3:
+            n.set_audio(audio.Default, loop=False)
+        else:
+            n.set_audio(audio.Silent, loop=False)
+        n.show()
+    except Exception as e:
+        log(f"toast failed ({e!r}), console only")
+
+# ---------- subscribe ----------
+def stream(client, topic):
+    """Yield parsed events from one topic's JSON stream."""
+    url = f"{NTFY_BASE}/{topic}/json"
+    with client.stream("GET", url, headers={
+            "Authorization": f"Bearer {NTFY_TOKEN}"}) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+def run():
+    global LOG_PATH
+    from pathlib import Path
+    logdir = Path(os.environ.get("FP_LOG_DIR", Path(__file__).parent / "logs"))
+    logdir.mkdir(exist_ok=True)
+    LOG_PATH = logdir / "pc_subscriber.log"
+
+    log(f"FuckPush PC subscriber starting, server={NTFY_BASE}, topics={TOPICS}")
+    while True:  # outer reconnect loop
+        try:
+            with httpx.Client(timeout=httpx.Timeout(connect=15, read=None,
+                                                    write=15, pool=15)) as client:
+                # fan-in multiple topics via generator chain (round-robin is
+                # overkill for 2 topics; run them sequentially per cycle is
+                # wrong, so spawn threads)
+                import threading
+                stop = threading.Event()
+
+                def worker(topic):
+                    while not stop.is_set():
+                        try:
+                            for ev in stream(client, topic):
+                                handle(ev)
+                        except Exception as e:
+                            log(f"[{topic}] stream error: {e!r}, retry in 5s")
+                            stop.wait(5)
+
+                threads = [threading.Thread(target=worker, args=(t,), daemon=True)
+                           for t in TOPICS]
+                for t in threads:
+                    t.start()
+                while any(t.is_alive() for t in threads):
+                    time.sleep(5)
+        except KeyboardInterrupt:
+            log("bye")
+            return
+        except Exception as e:
+            log(f"fatal: {e!r}, restart in 10s")
+            time.sleep(10)
+
+def handle(ev):
+    if ev.get("event") != "message":
+        if ev.get("event") == "keepalive":
+            return
+        return
+    title = ev.get("title") or ev.get("topic", "fuckpush")
+    msg = ev.get("message", "")
+    prio = ev.get("priority", 3)
+    log(f"PUSH [{ev.get('topic')}] prio={prio} | {title}: {msg}")
+    toast(title, msg, prio)
+
+def self_test():
+    """Send a test message through the server so we see it arrive."""
+    payload = {"topic": "fp-vps", "title": "自测消息",
+               "message": "PC subscriber 自测：看到这条说明链路通",
+               "priority": 4, "tags": ["zap"]}
+    r = httpx.post(NTFY_BASE + "/", json=payload,
+                   headers={"Authorization": f"Bearer {NTFY_TOKEN}"},
+                   timeout=10)
+    print("self-test publish:", r.status_code)
+
+if __name__ == "__main__":
+    if "--test" in sys.argv:
+        self_test()
+    run()

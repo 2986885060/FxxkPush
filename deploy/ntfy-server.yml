@@ -1,0 +1,20 @@
+# FuckPush VPS-side ntfy config (MVP)
+# Listens on a public port directly, HTTP only for now (TLS later).
+# Auth: token-based, topics are protected by default.
+
+listen-http: ":2586"
+behind-proxy: false
+
+# Keep memory tiny
+cache-file: "/var/cache/ntfy/cache.db"
+cache-duration: "12h"
+attachment-cache-dir: "/var/cache/ntfy/attachments"
+attachment-expiry-duration: "3h"
+
+# Logging
+log-level: INFO
+base-url: "http://185.170.211.73:2586"
+
+# Default: deny all, then allow subscribe for authenticated users.
+# We'll use access tokens per topic.
+auth-default-access: "deny-all"
