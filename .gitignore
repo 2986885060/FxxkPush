@@ -13,3 +13,4 @@ pc/vision_log.jsonl
 *.png
 *.bmp
 pc/listener_state.json
+pc/toast_echo.jsonl
