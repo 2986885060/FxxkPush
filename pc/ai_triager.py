@@ -143,6 +143,17 @@ async def handle_event(client, st, topic, ev):
     else:
         src = topic
 
+    # HARD RULE: @所有人 / @我 always push (bypasses AI + dedup). The vision
+    # listener flags these too, but the triager is the gate to the phone — if
+    # it does not enforce them here, its "群聊闲聊" verdict would silence a
+    # message the user explicitly wants.
+    if any(mark in content for mark in ("@所有人", "@我", "@全体成员")):
+        archive({"ts": time.time(), "topic": topic, "src": src,
+                 "content": content, "label": "重要", "reason": "@提及硬规则"})
+        ok = await push_phone(client, f"[提及] {src}", content[:200])
+        log(f"MENTION_PUSH {'ok' if ok else 'FAIL'} [{src}] {content[:50]}")
+        return
+
     # TEST RULE: anything containing "text" always goes straight to the
     # phone (bypasses AI + dedup) so omo can test the pipe anytime.
     if "text" in content.lower():
