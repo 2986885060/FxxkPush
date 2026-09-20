@@ -18,7 +18,7 @@ from pathlib import Path
 import httpx
 
 # ---------- config ----------
-NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://185.170.211.73:2586")
+NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
 _SECRET = Path(__file__).parent / "ntfy.secret"
 NTFY_TOKEN = os.environ.get("FP_NTFY_TOKEN") or (_SECRET.read_text().strip() if _SECRET.exists() else "")
 TOPICS = ["fp-vps", "fp-gray"]  # VPS hard alerts + gray-zone events
@@ -41,7 +41,22 @@ def get_toaster():
         _toaster = Notification
     return _toaster
 
+ECHO = Path(__file__).parent / "toast_echo.jsonl"
+
+
+def record_echo(title, message):
+    """Remember what we popped so notification_listener ignores the echo."""
+    try:
+        with ECHO.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": time.time(), "title": (title or "").strip(),
+                                "msg": (message or "").strip()},
+                               ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def toast(title, message, priority=3):
+    record_echo(title, message)
     try:
         from winotify import Notification, audio
         n = Notification(app_id="FuckPush",

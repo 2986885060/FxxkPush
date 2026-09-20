@@ -12,7 +12,9 @@ only one push goes out with a count. Daily report at configured time.
 Runs alongside pc_subscriber.py / notification_listener.py.
 """
 import asyncio
+import os
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -21,7 +23,7 @@ import httpx
 HERE = Path(__file__).parent
 CONFIG = json.loads((HERE / "triage_config.json").read_text(encoding="utf-8"))
 
-NTFY_BASE = "http://185.170.211.73:2586"
+NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
 _SECRET = HERE / "ntfy.secret"
 NTFY_TOKEN = (_SECRET.read_text().strip() if _SECRET.exists() else "")
 ARCHIVE = HERE / "triage_log.jsonl"
@@ -41,8 +43,30 @@ SYSTEM_PROMPT = """你是消息分诊助手。用户会在手机上收到你判�
 只输出 JSON，格式：{"label": "重要"|"忽略", "reason": "10字以内理由"}"""
 
 
+LOG_PATH = HERE / "logs" / "ai_triager.log"
+
+
 def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    # file log: pythonw runs have no console, a crash must leave evidence
+    try:
+        LOG_PATH.parent.mkdir(exist_ok=True)
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 2_000_000:
+            LOG_PATH.replace(LOG_PATH.with_suffix(".log.1"))
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _log_crash(exc_type, exc, tb):
+    import traceback
+    log("FATAL " + "".join(traceback.format_exception(exc_type, exc, tb)).strip())
+    os._exit(1)
+
+
+sys.excepthook = _log_crash
 
 
 def archive(rec):

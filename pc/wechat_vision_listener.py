@@ -12,8 +12,10 @@ Important rules (user-defined):
 Schedule: active 08:00-23:59, quiet 00:00-07:59.
 """
 import base64
+import os
 import ctypes
 import json
+import sys
 import time
 from ctypes import wintypes
 from datetime import datetime
@@ -22,7 +24,7 @@ from pathlib import Path
 import httpx
 
 HERE = Path(__file__).parent
-NTFY_BASE = "http://185.170.211.73:2586"
+NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
 NTFY_TOKEN = (HERE / "ntfy.secret").read_text().strip()
 CFG = json.loads((HERE / "triage_config.json").read_text(encoding="utf-8"))
 ARCHIVE = HERE / "vision_log.jsonl"
@@ -34,6 +36,17 @@ MY_NAME = CFG.get("wechat_my_name", "哦莫")  # used to detect @我
 USER32 = ctypes.windll.user32
 GDI32 = ctypes.windll.gdi32
 
+# Coordinate math must use PHYSICAL pixels: a DPI-unaware process sees a
+# virtualized screen width (e.g. 2048 instead of 2560 at 125% scaling), which
+# makes the "off-screen" park position land inside the visible area.
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+except Exception:
+    try:
+        USER32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 TARGETS = {
     "wechat": {"class": "Qt51514", "title": None, "min_w": 400},
     "wecom": {"class": "WeWorkWindow", "title": "企业微信", "min_w": 500},
@@ -44,8 +57,29 @@ IGNORE_CHATS = {"微信支付", "公众号", "服务通知", "QQ邮箱提醒", "
                 "应用提醒", "失物招领&寻物启事"}
 
 
+LOG_PATH = HERE / "logs" / "wechat_vision.log"
+
+
 def log(msg):
-    print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
+    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
+    print(line, flush=True)
+    try:
+        LOG_PATH.parent.mkdir(exist_ok=True)
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 2_000_000:
+            LOG_PATH.replace(LOG_PATH.with_suffix(".log.1"))
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _log_crash(exc_type, exc, tb):
+    import traceback
+    log("FATAL " + "".join(traceback.format_exception(exc_type, exc, tb)).strip())
+    os._exit(1)
+
+
+sys.excepthook = _log_crash
 
 
 def archive(rec):
@@ -76,9 +110,59 @@ def find_window(cls_substr: str, title: str | None, min_w: int):
     return wins[0] if wins else None
 
 
+def park_needed(hwnd) -> bool:
+    """True when any part of the window overlaps a monitor's work area."""
+    rect = wintypes.RECT()
+    if not USER32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+    overlapped = [False]
+    class RECT(ctypes.Structure):
+        _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
+                    ("r", ctypes.c_long), ("b", ctypes.c_long)]
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT),
+                    ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
+    CB = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_ulong, ctypes.c_ulong,
+                            ctypes.POINTER(RECT), ctypes.c_double)
+
+    def cb(hmon, hdc, lprc, data):
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        USER32.GetMonitorInfoW(hmon, ctypes.byref(mi))
+        w = mi.rcWork
+        if (rect.left < w.r and rect.right > w.l
+                and rect.top < w.b and rect.bottom > w.t):
+            overlapped[0] = True
+        return True
+
+    USER32.EnumDisplayMonitors(0, None, CB(cb), 0)
+    return overlapped[0]
+
+
 def move_offscreen(hwnd, w, h):
-    sw = USER32.GetSystemMetrics(0)
-    USER32.SetWindowPos(hwnd, 0, sw + OFFSCREEN_X_OFFSET, 100, w, h, 0x0004)
+    """Park the window just beyond the right edge of the rightmost monitor."""
+    right_edge = USER32.GetSystemMetrics(0)  # primary width; extend below if multi-monitor
+    overlapped = [right_edge]
+    class RECT(ctypes.Structure):
+        _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
+                    ("r", ctypes.c_long), ("b", ctypes.c_long)]
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT),
+                    ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
+    CB = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_ulong, ctypes.c_ulong,
+                            ctypes.POINTER(RECT), ctypes.c_double)
+
+    def cb(hmon, hdc, lprc, data):
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        USER32.GetMonitorInfoW(hmon, ctypes.byref(mi))
+        if mi.rcMonitor.r > overlapped[0]:
+            overlapped[0] = mi.rcMonitor.r
+        return True
+
+    USER32.EnumDisplayMonitors(0, None, CB(cb), 0)
+    USER32.SetWindowPos(hwnd, 0, overlapped[0] + OFFSCREEN_X_OFFSET, 100,
+                        w, h, 0x0004)
 
 
 def capture(hwnd) -> tuple[bytes, int, int] | None:
@@ -196,7 +280,7 @@ def scan_app(app: str, cfg: dict) -> dict | None:
         log(f"[{app}] window not found (closed/tray?), skip")
         return None
     hwnd, x, y, w, h = info
-    if x < 3000:  # still on-screen → park it
+    if park_needed(hwnd):  # any part visible → park it
         move_offscreen(hwnd, w, h)
     cap = capture(hwnd)
     if not cap:
@@ -245,7 +329,7 @@ def main():
         info = find_window(cfg["class"], cfg["title"], cfg["min_w"])
         if info:
             hwnd, x, y, w, h = info
-            if x < 3000:
+            if park_needed(hwnd):
                 move_offscreen(hwnd, w, h)
             log(f"[{app}] hwnd={hwnd} parked")
         else:

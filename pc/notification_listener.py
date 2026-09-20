@@ -12,6 +12,7 @@ marked app_unknown=true so the AI layer can learn them.
 import asyncio
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from winrt.windows.ui.notifications.management import (
 )
 
 # ---------- config ----------
-NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://185.170.211.73:2586")
+NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
 _SECRET = Path(__file__).parent / "ntfy.secret"
 NTFY_TOKEN = os.environ.get("FP_NTFY_TOKEN") or (_SECRET.read_text().strip() if _SECRET.exists() else "")
 TOPIC = "fp-pc"
@@ -38,10 +39,67 @@ WATCHLIST = {"QQ", "微信", "WeChat", "钉钉", "DingTalk", "TIM", "学习通",
 IGNORE = {"Windows.Defender.SecurityCenter", "无线", "AMD Software",
           "Microsoft Store", "Settings", "Windows 安全中心"}
 
+# Our OWN toasts (popped by pc_subscriber) come back through the notification
+# API and would be re-triaged and re-pushed to the phone -> feedback loop.
+# Skip anything we produced ourselves.
+SELF_MARKERS = {"fuckpush", "fxxkpush", "winotify", "python", "pythonw"}
+# pc_subscriber writes every toast it pops to this file; Windows hands the same
+# toast back to us as a notification a moment later (app name resolves to "?"),
+# so match on content instead of app identity.
+ECHO_FILE = Path(__file__).parent / "toast_echo.jsonl"
+ECHO_WINDOW = 180  # seconds
+
+
+def _norm(s: str) -> str:
+    return " ".join((s or "").split()).lower()
+
+
+def is_our_toast(texts) -> bool:
+    """True when these texts match a toast we popped ourselves recently."""
+    if not ECHO_FILE.exists():
+        return False
+    incoming = _norm(" ".join(texts))[:200]
+    if not incoming:
+        return False
+    cutoff = time.time() - ECHO_WINDOW
+    try:
+        for line in ECHO_FILE.read_text(encoding="utf-8").splitlines()[-60:]:
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            if rec.get("ts", 0) < cutoff:
+                continue
+            fp = _norm(f'{rec.get("title", "")} {rec.get("msg", "")}')[:200]
+            if fp and (fp == incoming or fp in incoming or incoming in fp):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+LOG_PATH = Path(__file__).parent / "logs" / "notification_listener.log"
+
 
 def log(msg):
-    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
     print(line, flush=True)
+    try:
+        LOG_PATH.parent.mkdir(exist_ok=True)
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 2_000_000:
+            LOG_PATH.replace(LOG_PATH.with_suffix(".log.1"))
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _log_crash(exc_type, exc, tb):
+    import traceback
+    log("FATAL " + "".join(traceback.format_exception(exc_type, exc, tb)).strip())
+    os._exit(1)
+
+
+sys.excepthook = _log_crash
 
 
 def load_seen():
@@ -67,13 +125,16 @@ def extract(n) -> dict | None:
         app = "?"
     if app in IGNORE:
         return None
-    texts = []
+    if app and any(m in app.lower() for m in SELF_MARKERS):
+        return None  # our own toast -> never re-triage
     try:
         binding = n.notification.visual.get_binding("ToastGeneric")
         if binding:
             texts = [t.text for t in binding.get_text_elements() if t.text]
     except Exception:
         pass
+    if is_our_toast(texts):
+        return None  # echo of a toast pc_subscriber popped -> do not re-triage
     return {
         "id": str(n.id),
         "app": app,

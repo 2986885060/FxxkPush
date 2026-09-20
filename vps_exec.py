@@ -11,6 +11,7 @@ Credentials come from vps.secret next to this file (never committed to git).
 import sys
 import os
 import stat
+import time
 from pathlib import Path
 
 import paramiko
@@ -48,12 +49,40 @@ def run(cli, cmd):
     return rc
 
 
-def put(cli, local, remote):
-    sftp = cli.open_sftp()
-    sftp.put(local, remote)
-    st = sftp.stat(remote)
-    print(f"uploaded {local} -> {remote} ({st.st_size} bytes)")
-    sftp.close()
+def put(cli, local, remote, retries=3):
+    """Upload via a temp file + atomic rename.
+
+    A dropped connection mid-transfer truncates whatever the SFTP client
+    opened, so never write straight to the destination: a flaky link would
+    leave an empty (or half-written) file behind and the service would die
+    on next restart. Upload to <remote>.tmp, verify the size, then move.
+    """
+    want = os.path.getsize(local)
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            sftp = cli.open_sftp()
+            tmp = remote + ".tmp"
+            sftp.put(local, tmp)
+            got = sftp.stat(tmp).st_size
+            if got != want:
+                raise IOError(f"short upload: {got} of {want} bytes")
+            try:
+                sftp.remove(remote)
+            except IOError:
+                pass
+            sftp.rename(tmp, remote)
+            final = sftp.stat(remote).st_size
+            sftp.close()
+            if final != want:
+                raise IOError(f"rename mismatch: {final} of {want} bytes")
+            print(f"uploaded {local} -> {remote} ({final} bytes)")
+            return
+        except Exception as e:
+            last_err = e
+            print(f"upload attempt {attempt}/{retries} failed: {e!r}", file=sys.stderr)
+            time.sleep(3)
+    raise SystemExit(f"upload failed after {retries} attempts: {last_err!r}")
 
 
 def get(cli, remote, local):

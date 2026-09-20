@@ -1,4 +1,4 @@
-# FxxkPush v0.2
+# FxxkPush v0.2.1
 
 自建 AI 消息分诊推送服务：PC 上的 AI 判断"哪些通知值得打扰手机"，重要的经 ntfy 推到手机/手表，垃圾静默归档。
 
@@ -24,11 +24,23 @@ Windows toast 通知（QQ/钉钉/学习通等）    │     ├─ 重要 → nt
 微信 + 企业微信（自绘UI，无系统通知）      │
   └─ wechat_vision_listener ─────────────┘
      （窗口藏屏外 + 定时截图 → MiMo 视觉分诊）
+
+PC 侧所有服务 → http://127.0.0.1:2586 → (pc/ntfy_tunnel.py 走 SSH) → VPS ntfy:2586
 ```
 
 - **VPS（1C1G）**：传感器 + 中继。ntfy 常驻（推送通道永远在线），日志硬规则判级（grep 级零内存），不跑 AI
 - **PC**：大脑 + 采集器。Windows 通知监听、微信/企业微信视觉识别、AI 分诊、结果推送
 - **手机**：ntfy 客户端接收 + Wear OS 手表震动，微信/QQ/企业微信后台全杀
+
+### 为什么 PC 侧要绕一条 SSH 隧道
+
+很多网络（校园网、公共 Wi-Fi、移动热点）会封掉非常规端口——本项目实测环境就封了 80 / 2586 / 8080 / 8888，而 SSH 端口放行。于是 `pc/ntfy_tunnel.py` 在本地监听 `127.0.0.1:2586`，把每个连接通过 SSH 的 `direct-tcpip` 通道转到 VPS 的 ntfy 上。好处：
+
+- 不管换到哪个网络，只要 SSH 通，推送通道就通
+- ntfy 端口不必对外暴露给 PC，暴露面更小
+- PC 侧所有服务只需认 `http://127.0.0.1:2586` 一个地址
+
+如果不需要（你的网络不封端口），把各服务里的 `FP_NTFY_URL` 环境变量设为直连地址即可，隧道进程可以不启动。
 
 ## 消息采集方式
 
@@ -58,7 +70,7 @@ Windows toast 通知（QQ/钉钉/学习通等）    │     ├─ 重要 → nt
 # 安装 ntfy（apt 源或 GitHub release 二进制均可）
 apt install ntfy
 
-# 应用服务端配置（按需改 listen 端口、base-url）
+# 应用服务端配置（记得改 base-url 成你自己的地址）
 cp deploy/ntfy-server.yml /etc/ntfy/server.yml
 
 # 创建管理员用户并签发 token（默认拒绝匿名访问）
@@ -87,6 +99,8 @@ Type=simple
 ExecStart=/usr/bin/python3 /opt/fuckpush/vps_monitor.py
 Environment=FP_NTFY_TOKEN=tk_你的token
 Environment=FP_NTFY_URL=http://127.0.0.1:2586/
+# 这些 IP 的 SSH 登录不上报（比如 VPS 自身、你自己的固定出口 IP），逗号分隔
+Environment=FP_SELF_IPS=你的VPS_IP
 Restart=on-failure
 RestartSec=10
 
@@ -96,6 +110,7 @@ WantedBy=multi-user.target
 
 ```bash
 systemctl daemon-reload && systemctl enable --now fuckpush-monitor
+systemctl is-active ntfy fuckpush-monitor   # 两个都应是 active
 ```
 
 ### 2. 手机：安装 ntfy 客户端
@@ -109,7 +124,7 @@ systemctl daemon-reload && systemctl enable --now fuckpush-monitor
 ```powershell
 # Python 3.12（pywinrt 3.2.1 不支持 3.14）
 uv venv .venv --python 3.12
-uv pip install --python .venv httpx winotify winrt-runtime `
+uv pip install --python .venv httpx winotify paramiko winrt-runtime `
   winrt-Windows.UI.Notifications.Management winrt-Windows.UI.Notifications `
   winrt-Windows.Foundation winrt-Windows.ApplicationModel winrt-Windows.Foundation.Collections
 
@@ -120,6 +135,7 @@ uv pip install --python .venv httpx winotify winrt-runtime `
 配置本地文件（都不入库）：
 
 ```
+vps.secret              # 一行：host port user password（隧道与 vps_exec.py 用）
 pc/ntfy.secret          # 一行：ntfy token（tk_xxx）
 pc/triage_config.json   # AI 配置，示例：
 {
@@ -136,22 +152,33 @@ pc/triage_config.json   # AI 配置，示例：
 
 ### 4. PC：启动与自启
 
-```powershell
-# 手动启动（四个都要）
-.venv\Scripts\pythonw.exe pc\pc_subscriber.py
-.venv\Scripts\pythonw.exe pc\notification_listener.py
-.venv\Scripts\pythonw.exe pc\ai_triager.py
-.venv\Scripts\pythonw.exe pc\wechat_vision_listener.py
+**启动顺序有意义**：隧道先起，其余服务才有 ntfy 可连。
 
-# 或注册登录自启
-pc\install_autostart.bat
+```powershell
+.venv\Scripts\pythonw.exe pc\ntfy_tunnel.py            # 1) 隧道（先起）
+Start-Sleep 5
+.venv\Scripts\pythonw.exe pc\pc_subscriber.py          # 2) 订阅 VPS 告警 → 弹 toast
+.venv\Scripts\pythonw.exe pc\notification_listener.py  # 3) 抓 Windows 通知
+.venv\Scripts\pythonw.exe pc\ai_triager.py             # 4) AI 分诊
+.venv\Scripts\pythonw.exe pc\wechat_vision_listener.py # 5) 微信/企业微信视觉识别
+
+# 或一键重启（已按正确顺序）：双击 pc\restart_services.bat
+# 或注册登录自启：pc\install_autostart.bat
 ```
+
+> 每个服务在任务管理器里会显示成 **2 个进程**（venv 的 `pythonw.exe` 是个跳板，会派生真正的解释器），所以 5 个服务 = 10 个进程，这是正常的。
 
 ### 5. 验证
 
-- 任意渠道发含 `text` 的消息 → 手机收到推送（测试通道，绕过 AI）
-- 让人给你微信发消息 → 30 分钟内 AI 分诊，重要则手机响
-- VPS 停一个被监控的服务 → 手机立刻收到告警
+```powershell
+# a) 隧道通不通
+curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0.1:2586/v1/health   # 期望 200
+
+# b) 端到端：任意渠道发含 text 的消息 → 手机收到（测试通道，绕过 AI 与去重）
+# c) 微信/企业微信：让人发条消息 → 30 分钟内 AI 分诊，重要则手机响
+# d) VPS：停一个被监控的服务 → 手机收到告警
+# e) 日志：pc\logs\*.log 是各服务的工作日志（pythonw 没有控制台，出问题看这里）
+```
 
 ## 组件
 
@@ -159,33 +186,39 @@ pc\install_autostart.bat
 |---|---|---|
 | `deploy/vps_monitor.py` | VPS (systemd) | journalctl 采集 + 硬规则判级 + 灰区落盘，60s 巡检，冷却去重 |
 | `deploy/ntfy-server.yml` | VPS | ntfy 服务端配置（token 鉴权，deny-all） |
+| `pc/ntfy_tunnel.py` | PC (自启) | SSH 本地转发：`127.0.0.1:2586` → VPS ntfy，绕开端口封锁，断线自愈 |
 | `pc/notification_listener.py` | PC (自启) | UserNotificationListener 抓 toast → fp-pc + JSONL 归档 |
 | `pc/wechat_vision_listener.py` | PC (自启) | 微信/企业微信窗口藏屏外 → 定时截图 → MiMo 视觉分诊 |
 | `pc/pc_subscriber.py` | PC (自启) | 订阅 fp-vps/fp-gray，弹 Windows toast |
 | `pc/ai_triager.py` | PC (自启) | 消费 fp-pc/fp-gray/fp-vps → AI 分诊 → fp-phone / 静默 |
+| `pc/park_windows.py` + `拖走聊天窗口.bat` | PC | 一键把微信/企业微信窗口挪到屏幕外（重启后手动归位用） |
 | `pc/probe_notifications.py` | PC | 通知权限探测/诊断工具 |
-| `vps_exec.py` | PC | SSH 执行助手（密码走 `vps.secret`，不入库） |
+| `pc/restart_services.bat` | PC | 按正确顺序重启全部服务 |
+| `vps_exec.py` | PC | SSH 执行助手：跑命令 / `--put` 上传（临时文件+原子替换，断线不会截断目标）/ `--get` |
 
 ## 配置文件（不入库，自建）
 
 | 文件 | 内容 |
 |---|---|
-| `vps.secret` | VPS SSH 密码（`host port user password` 四段） |
+| `vps.secret` | VPS SSH 凭据（`host port user password` 四段） |
 | `pc/ntfy.secret` | ntfy token（一行） |
 | `pc/triage_config.json` | AI API 地址/密钥/模型/轮询间隔/微信昵称 |
 
 ## 已知边界
 
 - 微信/企业微信消息推送有最长 30 分钟延迟（轮询间隔，用实时性换零打扰，`wechat_poll_min` 可调）
-- 微信/企业微信窗口不能最小化到托盘（藏屏幕外可以），否则截图为空
+- 微信/企业微信窗口不能最小化到托盘（藏屏幕外可以），否则截图为空；重启电脑后窗口会回到屏内，双击「拖走聊天窗口.bat」归位（vision listener 每轮也会自动归位）
+- 屏幕缩放非 100% 时，操作窗口坐标的脚本**必须**先声明 DPI-aware，否则 `GetSystemMetrics` 返回虚拟化尺寸（125% 下 2048 而非物理 2560），算出的"屏幕外"位置会落在屏幕里
+- `pc_subscriber` 弹的 toast 会被 `notification_listener` 再抓一次（自己吃自己的尾巴），已用 `pc/toast_echo.jsonl` 指纹在 180 秒窗口内过滤
 - pywinrt 3.2.1 需要 Python ≤3.12（3.14 报 cannot create instances）
-- 本机若有 TUN 代理（v2rayN/sing-box），SSH 直连端口可能被截，注意换端口
+- 语音/图片类通知：图片通知走视觉模型可判，语音只能看到"发来一条语音"而不知内容
 - ReviOS 精简版需验证通知中心可用（本项目环境已验证）
 
 ## Roadmap
 
 - [x] v0.1：QQ 等系统通知 + VPS 告警 + AI 分诊 + 手机推送
 - [x] v0.2：微信/企业微信视觉识别，@所有人/@我 必推，夜间静默（00:00-08:00）
+- [x] v0.2.1：SSH 隧道抗端口封锁、通知回流修复、服务文件日志与崩溃留痕、DPI 修正、窗口一键归位
 - [ ] 钉钉 / 学习通等更多 App 深度适配
 - [ ] 每日日报（AI 汇总当天事件/误判，22:00 推手机）
 - [ ] 误判样本积累 → 未来 27B 模型微调

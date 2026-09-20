@@ -26,6 +26,9 @@ from pathlib import Path
 # ---------- config ----------
 NTFY_URL = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586/")
 NTFY_TOKEN = os.environ.get("FP_NTFY_TOKEN", "")
+# IPs that never trigger a "root SSH login" alert (e.g. the VPS's own address,
+# or your home/office egress). Comma separated.
+SELF_IPS = tuple(x.strip() for x in os.environ.get("FP_SELF_IPS", "").split(",") if x.strip())
 TOPIC_HARD = "fp-vps"        # hard-rule alerts -> PC (PC relays to phone after AI)
 TOPIC_GRAY = "fp-gray"       # gray-zone events -> PC for AI triage
 GRAY_LOG = Path("/var/log/fuckpush/gray.log")
@@ -149,7 +152,7 @@ def check_ssh_login(since_ts):
         # root login or any login from a new IP is push-worthy.
         # skip monitor/paramiko self-connections from the VPS itself
         # and our own PC's known egress below.
-        if ip in ("185.170.211.73",) or ip.startswith("127."):
+        if ip in SELF_IPS or ip.startswith("127."):
             continue
         if user == "root" and allowed(f"ssh-login:{ip}", cooldown=86400):
             n = _state["counts"].get(f"ssh-login:{ip}", 0)
