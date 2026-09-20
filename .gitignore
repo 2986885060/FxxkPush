@@ -1,0 +1,7 @@
+vps.secret
+pc/triage_config.json
+__pycache__/
+*.pyc
+.venv/
+*.log
+ntfy.secret
