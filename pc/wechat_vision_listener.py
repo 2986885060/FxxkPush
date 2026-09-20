@@ -28,6 +28,8 @@ NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tu
 NTFY_TOKEN = (HERE / "ntfy.secret").read_text().strip()
 CFG = json.loads((HERE / "triage_config.json").read_text(encoding="utf-8"))
 ARCHIVE = HERE / "vision_log.jsonl"
+SEEN_STATE = HERE / "vision_state.json"
+SEEN_TTL = 6 * 3600  # don't re-report the same unread content for 6h
 POLL_MIN = CFG.get("wechat_poll_min", 30)
 ACTIVE_FROM, ACTIVE_TO = 8, 24
 OFFSCREEN_X_OFFSET = 120
@@ -80,6 +82,26 @@ def _log_crash(exc_type, exc, tb):
 
 
 sys.excepthook = _log_crash
+
+
+def _seen_load() -> dict:
+    try:
+        return json.loads(SEEN_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _seen_save(state: dict):
+    now = time.time()
+    state = {k: v for k, v in state.items() if now - v < SEEN_TTL}
+    try:
+        SEEN_STATE.write_text(json.dumps(state), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _sig(app: str, chat: str, preview: str) -> str:
+    return f"{app}|{chat}|{' '.join((preview or '').split())[:120]}"
 
 
 def archive(rec):
@@ -315,9 +337,25 @@ def handle(result: dict):
         if u.get("at_all") or u.get("at_me"):
             flagged[chat] = {"chat": chat,
                              "reason": "@所有人" if u.get("at_all") else "@我"}
+
+    # A chat stays "unread" until the user opens it, so without this the same
+    # message would be re-reported every poll (30 min) forever. Report a given
+    # (chat, preview) once, then stay quiet until the preview actually changes.
+    seen = _seen_load()
+    now = time.time()
+    fresh = {}
     for chat, info in flagged.items():
         preview = next((u.get("preview", "") for u in unread
                         if u.get("chat") == chat), "")
+        sig = _sig(app, chat, preview)
+        if now - seen.get(sig, 0) < SEEN_TTL:
+            log(f"[{app}] {chat} 与上次相同，跳过重复推送")
+            continue
+        seen[sig] = now
+        fresh[chat] = (info, preview)
+    _seen_save(seen)
+
+    for chat, (info, preview) in fresh.items():
         reason = info.get("reason", "")
         ok = push(f"{label}: {chat}", f"{preview}\n— {reason}", priority=4)
         log(f"{'PUSHED' if ok else 'PUSH_FAIL'} [{label}:{chat}] {reason}")
