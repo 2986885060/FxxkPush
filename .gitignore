@@ -5,3 +5,7 @@ __pycache__/
 .venv/
 *.log
 ntfy.secret
+pc/listener_state.json
+pc/notifications.jsonl
+pc/triage_log.jsonl
+pc/triage_state.json
