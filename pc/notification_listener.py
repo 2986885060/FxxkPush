@@ -105,7 +105,7 @@ sys.excepthook = _log_crash
 def load_seen():
     if STATE.exists():
         try:
-            return set(json.loads(STATE.read_text()))
+            return set(json.loads(STATE.read_text(encoding="utf-8")))
         except Exception:
             return set()
     return set()
@@ -129,7 +129,7 @@ def save_seen(seen, cap=2000):
         keep = sorted(seen, key=_key)[-cap:]
         seen.clear()
         seen.update(keep)
-    STATE.write_text(json.dumps(sorted(seen)))
+    STATE.write_text(json.dumps(sorted(seen)), encoding="utf-8")
 
 
 def extract(n) -> dict | None:
