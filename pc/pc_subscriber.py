@@ -107,7 +107,12 @@ def run():
                                                         write=15, pool=15),
                                   trust_env=False) as client:
                     for ev in stream(client, topic):
-                        handle(ev)
+                        try:
+                            handle(ev)
+                        except Exception as e:
+                            # 单条失败不断流：SSE 重连不回放，断开的 5 秒里
+                            # 这个 topic 的消息会丢（与 ai_triager.consume 同构）。
+                            log(f"[{topic}] handle failed ({e!r}), stream stays up")
             except Exception as e:
                 log(f"[{topic}] stream error: {e!r}, retry in 5s")
             stop.wait(5)

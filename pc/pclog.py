@@ -193,6 +193,10 @@ def tags_with_trace(tags=None) -> list:
     """给 ntfy payload 的 tags 挂上当前 trace_id（替掉已有的，避免累积）。
 
     发布方调它：同一条消息在所有订阅方日志里都叫同一个 trace。
+    当前没有 trace 时会**生成并绑定**（这样发布方自己的日志也带上同一串 id，
+    链路才完整）—— 但绑定后不恢复，所以在长驻进程里必须放在
+    ``with pclog.trace(...)`` 内调用，否则之后的心跳/重连日志都会挂上这条
+    消息的 id（bind_from_event 有同样的坑，那边已标注）。
     """
     tid = _trace.get()
     if tid == "-":
