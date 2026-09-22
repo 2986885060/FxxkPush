@@ -92,12 +92,21 @@ def _token() -> str:
     （成功才缓存、失败留重试和告警）矛盾。宁可每条多读一次小文件。
     测试里直接替换 _token 这个函数对象即可绕过缓存。"""
     global _token_cache
-    if _token_cache is None:
+    if _token_cache is None or _token_cache == "":
         try:
-            _token_cache = (HERE / "ntfy.secret").read_text(encoding="utf-8").strip()
+            tok = (HERE / "ntfy.secret").read_text(encoding="utf-8").strip()
         except Exception as e:
             log(f"ntfy.secret unreadable ({e!r}) —— 本轮推送不带反馈按钮")
             return ""
+        if not tok:
+            # 文件存在但空/全空白（部署顺序、占位文件、写入未完成）：
+            # 和读失败一个待遇 —— 不缓存、打日志、下次重试。缓存空串的
+            # 话，之后补上真 token 也不生效，直到进程重启，而且从头到尾
+            # 一行日志都没有 —— 正是本函数 docstring 里写明要避免的那件事，
+            # 第 3 轮只堵了异常路径、漏了这条（第 4 轮）。
+            log("ntfy.secret is empty —— 本轮推送不带反馈按钮")
+            return ""
+        _token_cache = tok
     return _token_cache
 
 
@@ -168,9 +177,14 @@ def _load_rules() -> dict:
                                 if isinstance(v, dict)}
         _rules_cache = fresh
         _rules_mtime = mtime
-    # fresh/_rules_cache 在所有分支都已赋值，类型收窄靠这个断言之后的局部量
+    # fresh/_rules_cache 在所有分支都已赋值。真要走到非 dict（理论上不可
+    # 达），也不能让它抛出去破坏 handle「不得抛」的契约 —— 原来的写法还
+    # 配了一句「类型收窄靠这个断言」，可代码里根本没有断言（第 4 轮）。
     rules = _rules_cache
-    return rules if rules is not None else {"sources": {}}
+    if not isinstance(rules, dict):
+        rules = {"sources": {}}
+        _rules_cache = rules
+    return rules
 
 
 def _save_rules(rules: dict) -> None:
@@ -210,10 +224,11 @@ def _save_rules(rules: dict) -> None:
 def should_ignore(src: str) -> bool:
     """主链路的快速路：True = 这个源已判定为噪音，连 AI 都不用问。
 
-    isinstance 校验是给 _load_rules 之外的路径兜底的纵深防御：规则文件里
-    要是出现 ``"QQ": "ignore"`` 这种「值不是对象」的形状，读端直接 .get()
-    会 AttributeError —— 而这条调用在 classify 的 try 之外，冒出去会被
-    consume 吞掉，那条消息连归档都不归档，比「回到每条问 AI」更糟。
+    isinstance 的实际作用只剩兜 ``.get(src)`` 拿不到键时的 None ——
+    「值不是对象」那个形状 _load_rules 读端已经洗掉了，这里不是为它服务的
+    （第 4 轮更正：注释原来声称是纵深防御，会误导后续维护）。仍留在这个
+    调用在 classify 的 try 之外，冒出去会被 consume 吞掉，那条消息连归档
+    都不归档，比「回到每条问 AI」更糟。
     """
     if not src:
         return False
@@ -351,9 +366,15 @@ def stats(since: float | None = None) -> dict:
             continue
         try:
             rec = json.loads(line)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
             continue
-        if rec.get("ts", 0) < since:
+        # 手改 feedback.jsonl 会造出「可解析但形状不对」的行：rec 不是对象
+        # → AttributeError，ts 是字符串/null → TypeError，都会冒到 CLI 直接
+        # 打 traceback（第 3 轮给 state 补过同类防护，这里没跟上）。
+        if not isinstance(rec, dict):
+            continue
+        ts = rec.get("ts")
+        if not isinstance(ts, (int, float)) or isinstance(ts, bool) or ts < since:
             continue
         v = rec.get("verdict")
         if not rec.get("matched"):
