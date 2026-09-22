@@ -29,8 +29,6 @@ import os
 import time
 from pathlib import Path
 
-import httpx
-
 import pclog
 
 HERE = Path(__file__).parent
@@ -154,6 +152,12 @@ def _load_rules() -> dict:
         # AttributeError，而那是在主链路里被调用的 —— 解析失败挡不住这一类。
         if not isinstance(fresh.get("sources"), dict):
             fresh["sources"] = {}
+        else:
+            # 单条 entry 也可能是 "QQ": "ignore" 这种形状。第 1 轮只给写端
+            # (_apply_rule)加了校验，读端(should_ignore / CLI)漏了 —— 在这里
+            # 一次性洗掉，读写两边就都不用各自再防一遍。
+            fresh["sources"] = {k: v for k, v in fresh["sources"].items()
+                                if isinstance(v, dict)}
         _rules_cache = fresh
         _rules_mtime = mtime
     # fresh/_rules_cache 在所有分支都已赋值，类型收窄靠这个断言之后的局部量
@@ -162,10 +166,16 @@ def _load_rules() -> dict:
 
 
 def _save_rules(rules: dict) -> None:
-    """原子写 + 主动刷新缓存。先 .tmp 再 rename，写一半断电不会留半个 JSON。"""
+    """原子写 + 主动刷新缓存。先落 .tmp 再 rename，写一半断电不会留半个 JSON。
+
+    临时名必须带 pid：现在有两个写者（常驻服务 + 命令行 CLI），共用一个固定
+    的 ``.tmp`` 会在两边同时写时交错出半截 JSON —— 那会被下次加载当成「损坏」
+    整个重置，学到的规则一条不剩。唯一临时名消掉交错；至于读-改-写互相覆盖
+    最多丢一次反馈计数，代价可接受，不值得为此引入文件锁。
+    """
     global _rules_cache, _rules_mtime
     rules["updated"] = time.time()
-    tmp = RULES_FILE.with_name(RULES_FILE.name + ".tmp")
+    tmp = RULES_FILE.with_name(f"{RULES_FILE.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(rules, ensure_ascii=False, indent=1),
                    encoding="utf-8")
     tmp.replace(RULES_FILE)
@@ -177,11 +187,17 @@ def _save_rules(rules: dict) -> None:
 
 
 def should_ignore(src: str) -> bool:
-    """主链路的快速路：True = 这个源已判定为噪音，连 AI 都不用问。"""
+    """主链路的快速路：True = 这个源已判定为噪音，连 AI 都不用问。
+
+    isinstance 校验是给 _load_rules 之外的路径兜底的纵深防御：规则文件里
+    要是出现 ``"QQ": "ignore"`` 这种「值不是对象」的形状，读端直接 .get()
+    会 AttributeError —— 而这条调用在 classify 的 try 之外，冒出去会被
+    consume 吞掉，那条消息连归档都不归档，比「回到每条问 AI」更糟。
+    """
     if not src:
         return False
     entry = _load_rules().get("sources", {}).get(src)
-    return bool(entry) and entry.get("verdict") == "ignore"
+    return isinstance(entry, dict) and entry.get("verdict") == "ignore"
 
 
 def _apply_rule(src: str, verdict: str) -> None:
@@ -218,9 +234,12 @@ def _apply_rule(src: str, verdict: str) -> None:
         # 放出来的唯一路径：他主动对一个已被拉黑的源点了👍 —— 规则错了，
         # 立刻撤销，否则拉黑是单向门，误伤一次就永远收不到这个源了。
         # 计 prev_bad 而不是读 entry['bad']：good 分支刚刚把它减过 1。
-        entry["verdict"] = None
-        entry["bad"] = 0
-        log(f"RULE [{src}] 收到👍，撤销静默（撤销前误判计数 {prev_bad}）")
+        # manual 的静音不走这条路：那是人工刻意压掉的，只有 CLI unmute 能解，
+        # 否则一条几天前的旧通知就够把它放出来。
+        if not entry.get("manual"):
+            entry["verdict"] = None
+            entry["bad"] = 0
+            log(f"RULE [{src}] 收到👍，撤销静默（撤销前误判计数 {prev_bad}）")
     _save_rules(rules)
 
 
@@ -353,26 +372,36 @@ def _cli(argv: list[str]) -> int:
             print("(空，还没有任何规则)")
         for name, e in sorted(sources.items()):
             state = "静音中" if e.get("verdict") == "ignore" else "正常"
-            print(f"  {name:<16} {state:<6} bad={e.get('bad', 0)} "
+            manual = " [手动]" if e.get("manual") else ""
+            print(f"  {name:<16} {state:<6}{manual} bad={e.get('bad', 0)} "
                   f"good={e.get('good', 0)}")
+        if sources:
+            print("\n作用域：源级规则只作用于 Windows 通知（fp-pc）；"
+                  "VPS 硬告警 / 灰区通道不受影响")
     elif a.cmd == "mute":
         rules = _load_rules()
-        rules.setdefault("sources", {})[a.src] = {
-            "bad": rules.get("sources", {}).get(a.src, {}).get("bad", 0),
-            "good": rules.get("sources", {}).get(a.src, {}).get("good", 0),
-            "verdict": "ignore", "since": time.time(), "manual": True}
+        srcs = rules.setdefault("sources", {})
+        old = srcs.get(a.src)
+        old = old if isinstance(old, dict) else {}
+        srcs[a.src] = {"bad": old.get("bad", 0), "good": old.get("good", 0),
+                       "verdict": "ignore", "since": time.time(),
+                       "manual": True}
         _save_rules(rules)
-        print(f"已静音 [{a.src}]（走 CLI 的 mute，manual=true）")
+        # 不能只报「已静音」就完事：如果这个名字其实是 fp-vps 通道，闸门的
+        # topic=="fp-pc" 根本不会查它，那是静默无效的假成功。
+        print(f"已静音 [{a.src}]（manual，👍 不会自动撤销，需 unmute 解除）")
+        print("作用域：仅 Windows 通知（fp-pc）。VPS 硬告警 / 灰区通道不受影响。")
     elif a.cmd == "unmute":
         rules = _load_rules()
         e = rules.get("sources", {}).get(a.src)
-        if not e:
+        if not isinstance(e, dict):
             print(f"[{a.src}] 没有规则，无需解除")
         else:
             e["verdict"] = None
-            e.pop("manual", None)
+            e["bad"] = 0          # 不清零的话 bad≥3 → 解除 → 下一条👎 立刻又静音，
+            e.pop("manual", None)  # 解锁入口等于没加（第 2 轮 P2）
             _save_rules(rules)
-            print(f"已解除 [{a.src}] 的静音，计数 bad={e.get('bad', 0)} 保留")
+            print(f"已解除 [{a.src}] 的静音，误判计数已清零")
     else:
         s = stats()
         print(f"近 24h：👍 {s['good']}  👎 {s['bad']}  "
