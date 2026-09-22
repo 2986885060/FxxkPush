@@ -219,6 +219,31 @@ curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0
 | `pc/restart_services.bat` | PC | 一键重启：调 `start_services.py`，带顺序与健康门 |
 | `vps_exec.py` | PC | SSH 执行助手：跑命令 / `--put` 上传（临时文件+原子替换，断线不会截断目标）/ `--get` |
 
+## 误判反馈闭环怎么干预
+
+推到手机的**AI 判定结果**带 👍/👎 按钮，反馈落到 `pc/feedback.jsonl`
+（自带内容快照 = 未来 27B 微调的语料），并按源累计：同一 src 连吃 3 次
+👎 → 之后该源静默跳过 AI（省一次模型调用），静音期间点 👍 立刻撤销。
+自动规则之外还有 CLI：
+
+```bash
+# 列出所有规则（含计数、是否 manual）
+.venv\Scripts\python.exe pc\fp_feedback.py list
+
+# 手动静音 / 解除。manual 静音不会被👍 自动撤销，只能这样解
+.venv\Scripts\python.exe pc\fp_feedback.py mute   某应用
+.venv\Scripts\python.exe pc\fp_feedback.py unmute 某应用   # 会清零误判计数
+
+# 近 24h 反馈统计
+.venv\Scripts\python.exe pc\fp_feedback.py stats
+```
+
+**作用域只覆盖 Windows 通知（`fp-pc`）**，按钮和闸门都是。原因：`fp-vps`
+/ `fp-gray` 的 src 恒等于 topic 名本身，规则粒度会退化成「整条通道」——
+对它们静音等于把服务器告警掐死（磁盘爆了手机不响），所以这两条通道既不放
+按钮，CLI 的 `mute` 对它们也无效。VPS 侧要禁用某类告警去改
+`deploy/vps_monitor.py` 的硬规则。
+
 ## 配置文件（不入库，自建）
 
 | 文件 | 内容 |
