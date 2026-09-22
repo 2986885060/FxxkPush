@@ -59,20 +59,12 @@ IGNORE_CHATS = {"微信支付", "公众号", "服务通知", "QQ邮箱提醒", "
                 "应用提醒", "失物招领&寻物启事"}
 
 
-LOG_PATH = HERE / "logs" / "wechat_vision.log"
+import pclog
+LOG = pclog.get_logger("wechat_vision")
 
 
 def log(msg):
-    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
-    print(line, flush=True)
-    try:
-        LOG_PATH.parent.mkdir(exist_ok=True)
-        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 2_000_000:
-            LOG_PATH.replace(LOG_PATH.with_suffix(".log.1"))
-        with LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+    pclog.log_auto(LOG, msg)
 
 
 def _log_crash(exc_type, exc, tb):
@@ -258,6 +250,7 @@ def analyze(bgra, w, h, app: str) -> dict | None:
             CFG["base_url"].rstrip("/") + "/chat/completions",
             headers={"Authorization": f"Bearer {CFG['api_key']}"},
             timeout=90,
+            trust_env=False,  # never route our traffic through the system proxy
             json={
                 "model": CFG["model"],
                 "messages": [
@@ -281,10 +274,13 @@ def analyze(bgra, w, h, app: str) -> dict | None:
 
 
 def push(title, message, priority=4):
+    # trace 由 main() 的每轮扫描创建，这里沿用它 —— 截图/识别/推送/归档
+    # 同一轮共享一个 id，tags_with_trace 在无 trace 时会自己补一个。
     try:
-        r = httpx.post(NTFY_BASE + "/", timeout=10, json={
+        r = httpx.post(NTFY_BASE + "/", timeout=10, trust_env=False, json={
             "topic": "fp-pc", "title": title[:120], "message": message[:500],
-            "priority": priority, "tags": ["bell"],
+            "priority": priority,
+            "tags": pclog.tags_with_trace(["bell"]),
         }, headers={"Authorization": f"Bearer {NTFY_TOKEN}"})
         return r.status_code == 200
     except Exception as e:
@@ -380,12 +376,17 @@ def main():
             continue
         time.sleep(POLL_MIN * 60)
         for app, cfg in TARGETS.items():
+            # 每轮每个 app 一个 trace：截图、识别、推送、归档全用同一个 id，
+            # 出问题时 grep 一次就能拉出这一轮的完整过程
+            pclog.set_trace_id(None)
             try:
                 result = scan_app(app, cfg)
                 if result:
                     handle(result)
             except Exception as e:
                 log(f"[{app}] cycle error: {e!r}")
+            finally:
+                pclog.set_trace_id("-")   # 不把 trace 带到下一轮/静默期日志
 
 
 if __name__ == "__main__":
