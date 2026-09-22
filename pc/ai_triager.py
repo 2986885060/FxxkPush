@@ -63,8 +63,12 @@ sys.excepthook = _log_crash
 
 
 def archive(rec):
-    with ARCHIVE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    try:
+        with ARCHIVE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        # 磁盘满/权限问题不该让一条消息掀翻消费循环
+        log(f"archive write failed: {e!r}")
 
 
 def load_state():
@@ -116,14 +120,20 @@ def dedup_check(st, kind, content) -> str | None:
 
 
 async def push_phone(client, title, message, priority=4):
-    r = await client.post(NTFY_BASE + "/", timeout=10, json={
-        "topic": TOPIC_OUT, "title": title, "message": message,
-        "priority": priority,
-        # tags carries the trace_id: ntfy drops every other custom field,
-        # so this is the only channel that can carry the chain to the phone.
-        "tags": pclog.tags_with_trace(["bell"]),
-    }, headers={"Authorization": f"Bearer {NTFY_TOKEN}"})
-    return r.status_code == 200
+    try:
+        r = await client.post(NTFY_BASE + "/", timeout=10, json={
+            "topic": TOPIC_OUT, "title": title, "message": message,
+            "priority": priority,
+            # tags carries the trace_id: ntfy drops every other custom field,
+            # so this is the only channel that can carry the chain to the phone.
+            "tags": pclog.tags_with_trace(["bell"]),
+        }, headers={"Authorization": f"Bearer {NTFY_TOKEN}"})
+        return r.status_code == 200
+    except Exception as e:
+        # 传输失败要在这里变成 False：冒出去会把整条 SSE 断掉（见 consume），
+        # 而推送失败恰恰发生在网络抖动的时候 —— 断流等于雪上加霜。
+        log(f"push_phone transport error: {e!r}")
+        return False
 
 
 async def handle_event(client, st, topic, ev):
@@ -229,8 +239,17 @@ async def consume(client, st, topic):
                             parsed = {"title": ev.get("title", ""), **parsed}
                 except json.JSONDecodeError:
                     parsed = {"title": ev.get("title", ""), "message": body}
-                await handle_event(client, st, topic, parsed)
-                save_state(st)
+                # 结构性兜底：单条消息失败绝不能断开 SSE —— 重连不回放，
+                # 断开的这几秒里该 topic 的消息会永久丢失。classify/push_phone
+                # 各自有 try，这里防的是 archive、未来的调用、以及任何没想到的
+                # 异常。save_state 放 finally：失败那条也得把去重状态存下去，
+                # 否则同一条消息重连后会再分诊一次。
+                try:
+                    await handle_event(client, st, topic, parsed)
+                except Exception as e:
+                    log(f"handle_event failed ({e!r}), stream stays up")
+                finally:
+                    save_state(st)
 
 
 async def main():
