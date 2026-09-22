@@ -204,8 +204,11 @@ def publish(ev: dict):
             log(f"ntfy publish failed: {e!r}")
             ok = False
         ev["pushed"] = ok
-        with ARCHIVE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        try:
+            pclog.append_rotating(ARCHIVE, json.dumps(ev, ensure_ascii=False),
+                                  mode="rotate")
+        except Exception as e:
+            log(f"archive write failed: {e!r}")
         log(f"{'PUSH' if ok else 'ARCH'} [{ev['app']}] {' | '.join(ev['texts'])[:80]}")
 
 

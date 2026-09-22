@@ -25,7 +25,8 @@ import httpx
 
 HERE = Path(__file__).parent
 NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
-NTFY_TOKEN = (HERE / "ntfy.secret").read_text().strip()
+NTFY_TOKEN = ((HERE / "ntfy.secret").read_text().strip()
+              if (HERE / "ntfy.secret").exists() else "")  # 与其他 3 个服务一致：缺 token 先跑起来，推送时 401 再报
 CFG = json.loads((HERE / "triage_config.json").read_text(encoding="utf-8"))
 ARCHIVE = HERE / "vision_log.jsonl"
 SEEN_STATE = HERE / "vision_state.json"
@@ -102,8 +103,11 @@ def _sig(app: str, chat: str, preview: str) -> str:
 
 
 def archive(rec):
-    with ARCHIVE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    try:
+        pclog.append_rotating(ARCHIVE, json.dumps(rec, ensure_ascii=False),
+                              mode="rotate")
+    except Exception as e:
+        log(f"archive write failed: {e!r}")
 
 
 def find_window(cls_substr: str, title: str | None, min_w: int):

@@ -189,6 +189,33 @@ def read_tail(path, n: int = 60, max_bytes: int = 65536) -> list[str]:
         return []
 
 
+def append_rotating(path, text: str, *, max_bytes: int = 512 * 1024,
+                    mode: str = "rotate") -> None:
+    """追加一行；文件超过 max_bytes 时按 mode 收缩。
+
+    mode="rotate"（归档类）：主文件改名 .1（旧 .1 丢弃），保留一段完整历史。
+    mode="tail"（回环指纹类）：只保留末尾一半，且从第一个完整行起切 —— 这类
+    文件只有最近的记录有用（is_our_toast 只读尾部 60 行），留历史没意义。
+
+    调用点自己包 try：归档失败不该中断主流程，但也不能静默吞掉（4 个 jsonl
+    原来全部零轮转，append-only 无限增长）。
+    """
+    path = Path(path)
+    if path.exists() and path.stat().st_size > max_bytes:
+        if mode == "tail":
+            data = path.read_bytes()[-(max_bytes // 2):]
+            nl = data.find(b"\n")
+            if nl != -1:
+                data = data[nl + 1:]
+            path.write_bytes(data)
+        else:
+            bak = path.with_name(path.name + ".1")
+            bak.unlink(missing_ok=True)
+            path.replace(bak)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(text if text.endswith("\n") else text + "\n")
+
+
 def tags_with_trace(tags=None) -> list:
     """给 ntfy payload 的 tags 挂上当前 trace_id（替掉已有的，避免累积）。
 

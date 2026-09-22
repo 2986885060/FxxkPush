@@ -16,3 +16,5 @@ pc/listener_state.json
 pc/toast_echo.jsonl
 pc/vision_state.json
 *.bak
+*.jsonl.1
+*.tmp
