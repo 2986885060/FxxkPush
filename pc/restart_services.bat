@@ -1,21 +1,28 @@
 @echo off
-REM FxxkPush PC services: manual restart helper (double-click or run in cmd).
-REM NOTE: venv pythonw.exe is a shim that spawns the real uv interpreter -
-REM each service legitimately shows as TWO processes (shim + worker).
-REM ORDER MATTERS: the ntfy_tunnel must come up first, the others need it.
+chcp 65001 >nul
+REM FxxkPush: restart all PC services.
+REM
+REM The real logic is in pc\start_services.py — it does the ordering and the
+REM health gate this script used to fake with `timeout /t 3`:
+REM   kill ours -> start tunnel -> poll /v1/health until 200 -> only then
+REM   start the rest -> verify every script has shim+worker = 2 processes.
+REM If the tunnel never goes green, nothing else starts (no pointless retry
+REM storm against a tunnel that is not up).
+REM
+REM Uses python.exe (console) so you can read each step; logs also go to
+REM pc\logs\start_services.log via pclog.
 
-set PYW=C:\Users\omo\fuckpush\.venv\Scripts\pythonw.exe
-set PC=C:\Users\omo\fuckpush\pc
+set "PY=C:\Users\omo\fuckpush\.venv\Scripts\python.exe"
+set "PC=C:\Users\omo\fuckpush\pc"
 
-echo Restarting FxxkPush services...
-taskkill /F /IM pythonw.exe 2>nul
-timeout /t 2 /nobreak >nul
+"%PY%" "%PC%\start_services.py"
+set RC=%ERRORLEVEL%
 
-start "" "%PYW%" "%PC%\ntfy_tunnel.py"
-timeout /t 3 /nobreak >nul
-start "" "%PYW%" "%PC%\pc_subscriber.py"
-start "" "%PYW%" "%PC%\notification_listener.py"
-start "" "%PYW%" "%PC%\ai_triager.py"
-start "" "%PYW%" "%PC%\wechat_vision_listener.py"
-
-echo Done. Verify with: tasklist ^| findstr pythonw  (expect 10 entries = 5x2)
+echo.
+if "%RC%"=="0" (
+    echo All services up. Manual check: tasklist ^| findstr pythonw  ^(expect 12 = 6x2^)
+) else (
+    echo start_services.py exited with code %RC% - see pc\logs\start_services.log
+)
+pause
+exit /b %RC%

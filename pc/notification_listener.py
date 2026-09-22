@@ -77,20 +77,12 @@ def is_our_toast(texts) -> bool:
     return False
 
 
-LOG_PATH = Path(__file__).parent / "logs" / "notification_listener.log"
+import pclog
+LOG = pclog.get_logger("notification_listener")
 
 
 def log(msg):
-    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
-    print(line, flush=True)
-    try:
-        LOG_PATH.parent.mkdir(exist_ok=True)
-        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 2_000_000:
-            LOG_PATH.replace(LOG_PATH.with_suffix(".log.1"))
-        with LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+    pclog.log_auto(LOG, msg)
 
 
 def _log_crash(exc_type, exc, tb):
@@ -162,27 +154,30 @@ async def poll_once(listener, seen) -> list[dict]:
 
 def publish(ev: dict):
     """Send to ntfy (fp-pc) + local archive."""
-    title = f"{ev['app']}: {ev['texts'][0][:60]}" if ev["texts"] else f"{ev['app']} 通知"
-    body = "\n".join(ev["texts"]) or "<no text>"
-    payload = {
-        "topic": TOPIC,
-        "title": title[:120],
-        "message": body[:500],
-        "priority": 3 if ev["watched"] else 1,
-        "tags": ["bell"] if ev["watched"] else ["question"],
-    }
-    try:
-        r = httpx.post(NTFY_BASE + "/", json=payload,
-                       headers={"Authorization": f"Bearer {NTFY_TOKEN}"},
-                       timeout=10)
-        ok = r.status_code == 200
-    except Exception as e:
-        log(f"ntfy publish failed: {e!r}")
-        ok = False
-    ev["pushed"] = ok
-    with ARCHIVE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-    log(f"{'PUSH' if ok else 'ARCH'} [{ev['app']}] {' | '.join(ev['texts'])[:80]}")
+    # 整条处理（组包 -> 发送 -> 归档 -> 日志）都放在 with 里：链路起点的
+    # 这几行日志必须带上本条消息的 trace，否则从 listener 这端就断了。
+    with pclog.trace(None):
+        title = f"{ev['app']}: {ev['texts'][0][:60]}" if ev["texts"] else f"{ev['app']} 通知"
+        body = "\n".join(ev["texts"]) or "<no text>"
+        payload = {
+            "topic": TOPIC,
+            "title": title[:120],
+            "message": body[:500],
+            "priority": 3 if ev["watched"] else 1,
+            "tags": pclog.tags_with_trace(["bell"] if ev["watched"] else ["question"]),
+        }
+        try:
+            r = httpx.post(NTFY_BASE + "/", json=payload,
+                           headers={"Authorization": f"Bearer {NTFY_TOKEN}"},
+                           timeout=10, trust_env=False)
+            ok = r.status_code == 200
+        except Exception as e:
+            log(f"ntfy publish failed: {e!r}")
+            ok = False
+        ev["pushed"] = ok
+        with ARCHIVE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        log(f"{'PUSH' if ok else 'ARCH'} [{ev['app']}] {' | '.join(ev['texts'])[:80]}")
 
 
 async def main():

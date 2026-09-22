@@ -24,8 +24,14 @@ LOCAL_HOST, LOCAL_PORT = "127.0.0.1", 2586
 REMOTE_HOST, REMOTE_PORT = "127.0.0.1", 2586
 
 
+import pclog
+LOG = pclog.get_logger("ntfy_tunnel")
+
+
 def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    # tunnel used to print to a console that pythonw does not have — every
+    # line it ever produced was silently lost. pclog writes to pc/logs too.
+    pclog.log_auto(LOG, msg)
 
 
 def read_secret():

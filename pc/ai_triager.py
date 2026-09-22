@@ -43,21 +43,14 @@ SYSTEM_PROMPT = """你是消息分诊助手。用户会在手机上收到你判�
 只输出 JSON，格式：{"label": "重要"|"忽略", "reason": "10字以内理由"}"""
 
 
-LOG_PATH = HERE / "logs" / "ai_triager.log"
+import pclog
+LOG = pclog.get_logger("ai_triager")
 
 
 def log(msg):
-    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
-    print(line, flush=True)
-    # file log: pythonw runs have no console, a crash must leave evidence
-    try:
-        LOG_PATH.parent.mkdir(exist_ok=True)
-        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 2_000_000:
-            LOG_PATH.replace(LOG_PATH.with_suffix(".log.1"))
-        with LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+    # file log: pythonw runs have no console, a crash must leave evidence.
+    # pclog owns rotation/format/level — do not hand-roll it here.
+    pclog.log_auto(LOG, msg)
 
 
 def _log_crash(exc_type, exc, tb):
@@ -125,7 +118,10 @@ def dedup_check(st, kind, content) -> str | None:
 async def push_phone(client, title, message, priority=4):
     r = await client.post(NTFY_BASE + "/", timeout=10, json={
         "topic": TOPIC_OUT, "title": title, "message": message,
-        "priority": priority, "tags": ["bell"],
+        "priority": priority,
+        # tags carries the trace_id: ntfy drops every other custom field,
+        # so this is the only channel that can carry the chain to the phone.
+        "tags": pclog.tags_with_trace(["bell"]),
     }, headers={"Authorization": f"Bearer {NTFY_TOKEN}"})
     return r.status_code == 200
 
@@ -211,6 +207,10 @@ async def consume(client, st, topic):
                 continue
             if ev.get("event") != "message":
                 continue
+            # trace_id starts here for this message: ntfy only forwards tags,
+            # so the id rides in tags (or falls back to the ntfy message id,
+            # which is identical for every subscriber of the same message).
+            pclog.bind_from_event(ev)
             # fp-pc arrives as JSON string inside message (from listener);
             # fp-gray is our gray JSON; fp-vps is plain text
             body = ev.get("message", "")
@@ -233,16 +233,22 @@ async def main():
     log(f"triager up: model={CONFIG['model']}, out={TOPIC_OUT}")
     st = load_state()
     timeout = httpx.Timeout(connect=15, read=None, write=15, pool=15)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        while True:
-            try:
+    while True:
+        # Rebuild the client on every reconnect attempt with trust_env=False.
+        # With trust_env on, httpx snapshots the Windows system proxy at
+        # construction time; the long-lived client then keeps retrying through
+        # a proxy port that v2rayN may have since torn down, and every request
+        # fails (WinError 10061) until the process restarts. We talk to a
+        # loopback tunnel and to the API directly, so never use a proxy.
+        try:
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
                 # one task per input topic
                 await asyncio.gather(
                     *(consume(client, st, t) for t in TOPICS_IN)
                 )
-            except Exception as e:
-                log(f"stream error: {e!r}, reconnect in 5s")
-                await asyncio.sleep(5)
+        except Exception as e:
+            log(f"stream error: {e!r}, reconnect in 5s")
+            await asyncio.sleep(5)
 
 
 if __name__ == "__main__":

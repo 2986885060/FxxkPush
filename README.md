@@ -1,4 +1,4 @@
-# FxxkPush v0.2.2
+# FxxkPush v0.3.0
 
 自建 AI 消息分诊推送服务：PC 上的 AI 判断"哪些通知值得打扰手机"，重要的经 ntfy 推到手机/手表，垃圾静默归档。
 
@@ -153,21 +153,33 @@ pc/triage_config.json   # AI 配置，示例：
 
 ### 4. PC：启动与自启
 
-**启动顺序有意义**：隧道先起，其余服务才有 ntfy 可连。
+**启动顺序 + 健康检查**：隧道必须先起来并确认 `health=200`，其余服务才启动。
+没有这道门，隧道慢一点（SSH 抖动、代理切换、开机网络未就绪），后面五个服务
+就会对着一个还没就绪的 `2586` 空转刷错，而且没有任何报错提示这是"启动顺序"问题。
 
 ```powershell
-.venv\Scripts\pythonw.exe pc\ntfy_tunnel.py            # 1) 隧道（先起）
+# 一键重启（含顺序与健康门）：双击 pc\restart_services.bat
+# 实际执行 pc\start_services.py：
+#   杀旧进程 -> 起隧道 -> 轮询 /v1/health 直到 200 -> 才起其余 5 个 -> 校验 6x2 进程
+.venv\Scripts\python.exe pc\start_services.py
+
+# 注册登录自启：pc\install_autostart.bat
+# （6 项，Windows 登录时并发启动；各服务自带重试，隧道就绪前会自动等待）
+```
+
+> 每个服务在任务管理器里会显示成 **2 个进程**（venv 的 `pythonw.exe` 是个跳板，会派生真正的解释器），所以 6 个服务 = 12 个进程，这是正常的。
+
+手动单起（不推荐，会跳过健康门）：
+
+```powershell
+.venv\Scripts\pythonw.exe pc\ntfy_tunnel.py            # 1) 隧道（必须先起）
 Start-Sleep 5
 .venv\Scripts\pythonw.exe pc\pc_subscriber.py          # 2) 订阅 VPS 告警 → 弹 toast
 .venv\Scripts\pythonw.exe pc\notification_listener.py  # 3) 抓 Windows 通知
 .venv\Scripts\pythonw.exe pc\ai_triager.py             # 4) AI 分诊
 .venv\Scripts\pythonw.exe pc\wechat_vision_listener.py # 5) 微信/企业微信视觉识别
-
-# 或一键重启（已按正确顺序）：双击 pc\restart_services.bat
-# 或注册登录自启：pc\install_autostart.bat
+.venv\Scripts\pythonw.exe pc\watchdog.py               # 6) 管道自检（故障直接推手机）
 ```
-
-> 每个服务在任务管理器里会显示成 **2 个进程**（venv 的 `pythonw.exe` 是个跳板，会派生真正的解释器），所以 5 个服务 = 10 个进程，这是正常的。
 
 ### 5. 验证
 
@@ -178,7 +190,10 @@ curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0
 # b) 端到端：任意渠道发含 text 的消息 → 手机收到（测试通道，绕过 AI 与去重）
 # c) 微信/企业微信：让人发条消息 → 30 分钟内 AI 分诊，重要则手机响
 # d) VPS：停一个被监控的服务 → 手机收到告警
-# e) 日志：pc\logs\*.log 是各服务的工作日志（pythonw 没有控制台，出问题看这里）
+# e) 日志：pc\logs\*.log 全部走 pc/pclog.py，统一格式 + 统一出口
+#    2026-09-22T13:20:01.781+0800 [INFO ] ai_triager | trace=verify1 | TEST_PUSH ok ...
+#    trace_id 贯穿一条消息的全链路，grep 一次就能拉出完整过程：
+#    grep "trace=verify1" pc/logs/*.log
 ```
 
 ## 组件
@@ -194,7 +209,10 @@ curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0
 | `pc/ai_triager.py` | PC (自启) | 消费 fp-pc/fp-gray/fp-vps → AI 分诊 → fp-phone / 静默 |
 | `pc/park_windows.py` + `拖走聊天窗口.bat` | PC | 一键把微信/企业微信窗口挪到屏幕外（重启后手动归位用） |
 | `pc/probe_notifications.py` | PC | 通知权限探测/诊断工具 |
-| `pc/restart_services.bat` | PC | 按正确顺序重启全部服务 |
+| `pc/pclog.py` | PC | 统一日志：单一格式（ISO 带日期 + level + 服务名 + trace_id）、单一出口（`pc/logs` + stderr）、RotatingFile 2MB×3、自动分级 |
+| `pc/start_services.py` | PC | 启动编排：杀旧 → 起隧道 → **健康门 `health=200`** → 起其余 → 校验 6×2 进程 |
+| `pc/watchdog.py` | PC (自启) | 管道自检：health / 进程 / 连接错误三项，连续 5 分钟不健康 → 绕过 AI 直推 fp-phone（本地隧道优先，失败走 SSH 兜底） |
+| `pc/restart_services.bat` | PC | 一键重启：调 `start_services.py`，带顺序与健康门 |
 | `vps_exec.py` | PC | SSH 执行助手：跑命令 / `--put` 上传（临时文件+原子替换，断线不会截断目标）/ `--get` |
 
 ## 配置文件（不入库，自建）
@@ -213,6 +231,8 @@ curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0
 - `pc_subscriber` 弹的 toast 会被 `notification_listener` 再抓一次（自己吃自己的尾巴），已用 `pc/toast_echo.jsonl` 指纹在 180 秒窗口内过滤
 - pywinrt 3.2.1 需要 Python ≤3.12（3.14 报 cannot create instances）
 - 语音/图片类通知：图片通知走视觉模型可判，语音只能看到"发来一条语音"而不知内容
+- **httpx 默认 `trust_env=True` 会读 Windows 系统代理**（v2rayN 的 `127.0.0.1:12334`）：长寿命客户端在代理关掉后会永久抱死该端口，所有请求 `WinError 10061` 直到进程重启。本项目所有 httpx 客户端一律 `trust_env=False`，且重连时**重建客户端不复用**
+- **ntfy 只透传已知字段**：自定义 header（`X-Fp-Trace`）和未知 JSON 字段（`trace_id`/`sequence_id`）都会被服务端静默丢弃（HTTP 200 但订阅端收不到），只有 `tags` 完整回传 —— 所以 trace_id 寄生在 `tags` 里（`t_<8位hex>`）
 - ReviOS 精简版需验证通知中心可用（本项目环境已验证）
 
 ## Roadmap
@@ -221,6 +241,7 @@ curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0
 - [x] v0.2：微信/企业微信视觉识别，@所有人/@我 必推，夜间静默（00:00-08:00）
 - [x] v0.2.1：SSH 隧道抗端口封锁、通知回流修复、服务文件日志与崩溃留痕、DPI 修正、窗口一键归位
 - [x] v0.2.2：@提及硬规则下沉到手机闸门（修复被 AI 覆盖导致 @所有人 不推）、同一未读消息 6 小时内只报一次
+- [x] v0.3.0：统一日志 `pc/pclog.py`（格式/出口/level/trace_id 贯穿全链路）、启动健康门（`health=200` 才起服务）、管道自检看门狗（故障绕过 AI 直推手机，SSH 独立告警通道）、httpx 系统代理毒化修复（`trust_env=False`）
 - [ ] 钉钉 / 学习通等更多 App 深度适配
 - [ ] 每日日报（AI 汇总当天事件/误判，22:00 推手机）
 - [ ] 误判样本积累 → 未来 27B 模型微调
