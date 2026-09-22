@@ -133,9 +133,11 @@ def check_link() -> tuple[bool, str]:
         p = LOG_DIR / f"{svc}.log"
         if not p.exists():
             continue
-        try:
-            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()[-60:]
-        except Exception:
+        # 只读尾部：原来是 read_text().splitlines()[-60:] —— 为了 60 行
+        # 把整个日志读进来。2MB 轮转阈值 x 2 个文件 x 每 60 秒一次 ≈ 5.7GB/天
+        # 的纯磁盘读，全喂给页缓存。
+        lines = pclog.read_tail(p, 60)
+        if not lines:
             continue
         errs = oks = 0
         for ln in lines:
@@ -158,14 +160,17 @@ CHECKS = [("health", check_health), ("procs", check_procs), ("link", check_link)
 
 # ------------------------------------------------- 告警通道（独立于隧道）
 def _ntfy_payload(title: str, message: str) -> dict:
-    pclog.set_trace_id(None)
-    return {
-        "topic": "fp-phone",
-        "title": title[:120],
-        "message": message[:900],
-        "priority": 4,                     # hard rule: high, 不经 AI
-        "tags": pclog.tags_with_trace(["bell", "rotating_light"]),
-    }
+    # 告警自带一个新 trace，但必须用 with 恢复 —— 直接 set_trace_id(None)
+    # 会把 trace 留在上下文里，之后的心跳日志全都挂上最后一次告警的 id，
+    # grep 心跳时会串到无关的告警上。
+    with pclog.trace(None):
+        return {
+            "topic": "fp-phone",
+            "title": title[:120],
+            "message": message[:900],
+            "priority": 4,                 # hard rule: high, 不经 AI
+            "tags": pclog.tags_with_trace(["bell", "rotating_light"]),
+        }
 
 
 def push_local(payload: dict) -> bool:
@@ -200,14 +205,20 @@ def push_vps(payload: dict) -> bool:
                     timeout=15, banner_timeout=20, auth_timeout=20)
         b64 = base64.b64encode(
             json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode()
+        # curl 走 shell 命令行，两个约束：整条命令的单引号必须是偶数
+        # （否则 shell 报未闭合、$() 拿到空串、push_vps 恒返回 False），
+        # 以及 token 只在取得到时才带 header。token 出现在命令行只在自己的
+        # VPS 上短暂可见（ps aux），可接受。
+        tok = _token()
+        auth = f"-H 'Authorization: Bearer {tok}' " if tok else ""
         cmd = (
             "set -e; "
             f"echo {b64} | base64 -d > /tmp/fp_watchdog_alert.json; "
             f"code=$(curl -s -o /dev/null -w '%{{http_code}}' "
-            f"-H 'Authorization: Bearer {_token()}' "
-            f"-H 'Content-Type: application/json' "
-            f"-d @/tmp/fp_watchdog_alert.json "
-            f"http://127.0.0.1:2586/); "
+            f"{auth}"
+            "-H 'Content-Type: application/json' "
+            "-d @/tmp/fp_watchdog_alert.json "
+            "http://127.0.0.1:2586/); "
             "rm -f /tmp/fp_watchdog_alert.json; "
             "echo $code"
         )

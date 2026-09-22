@@ -63,7 +63,9 @@ def is_our_toast(texts) -> bool:
         return False
     cutoff = time.time() - ECHO_WINDOW
     try:
-        for line in ECHO_FILE.read_text(encoding="utf-8").splitlines()[-60:]:
+        # 尾部读取：echo 文件是 append-only 无限增长，每次通知都全量读一遍
+        # 和 watchdog.check_link 同一个毛病
+        for line in pclog.read_tail(ECHO_FILE, 60):
             if not line.strip():
                 continue
             rec = json.loads(line)
@@ -104,8 +106,23 @@ def load_seen():
 
 
 def save_seen(seen, cap=2000):
+    """落盘并按 cap 截断（就地修改传入的 set）。
+
+    原实现 ``seen = set(sorted(seen)[-cap:])`` 只给局部变量重新绑定，外面的
+    set 纹丝不动 —— 截断只在写盘那一瞬生效，运行期间内存里的 seen 一直涨。
+    而且 set 无序、通知 id 是数字字符串，按字典序取"最后 2000 个"拿到的是
+    ['9','89','8'] 这种而不是最新的那批：截错方向会把仍在通知中心的 id 丢掉，
+    下一轮它们又被当成新通知重推一遍。
+    """
     if len(seen) > cap:
-        seen = set(sorted(seen)[-cap:])
+        def _key(x):
+            try:
+                return (1, int(x))     # 通知 id 单调递增，数值最大 = 最新
+            except ValueError:
+                return (0, x)
+        keep = sorted(seen, key=_key)[-cap:]
+        seen.clear()
+        seen.update(keep)
     STATE.write_text(json.dumps(sorted(seen)))
 
 
@@ -119,6 +136,12 @@ def extract(n) -> dict | None:
         return None
     if app and any(m in app.lower() for m in SELF_MARKERS):
         return None  # our own toast -> never re-triage
+    # texts 必须先给默认值：get_binding 抛异常、或 binding 为 None（非
+    # ToastGeneric 的通知）时它压根没被赋值，下面 is_our_toast(texts) 会
+    # NameError —— 而这发生在 poll_once 的 for 循环里，一炸整轮剩余通知
+    # 全部丢失，只在 main 的 except 里留一行 "poll error"（日志至今 0 次，
+    # 属于还没被触发的定时炸弹）。
+    texts = []
     try:
         binding = n.notification.visual.get_binding("ToastGeneric")
         if binding:
@@ -199,10 +222,15 @@ async def main():
 
     while True:
         try:
+            before = len(seen)
             events = await poll_once(listener, seen)
             for ev in events:
                 publish(ev)
-            if events:
+            # 按 seen 是否变化来存，不能只看 events：extract 返回 None 的
+            # 通知（IGNORE 名单 / 自己弹的 toast）照样 add 了 id 却不产出
+            # events。只在 events 非空时存盘，这批 id 下一轮又是"新的"，
+            # 每 3 秒重新 extract 一遍（含读 echo 文件）。
+            if events or len(seen) != before:
                 save_seen(seen)
         except Exception as e:
             log(f"poll error: {e!r}")

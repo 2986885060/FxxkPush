@@ -210,23 +210,27 @@ async def consume(client, st, topic):
             # trace_id starts here for this message: ntfy only forwards tags,
             # so the id rides in tags (or falls back to the ntfy message id,
             # which is identical for every subscriber of the same message).
-            pclog.bind_from_event(ev)
-            # fp-pc arrives as JSON string inside message (from listener);
-            # fp-gray is our gray JSON; fp-vps is plain text
-            body = ev.get("message", "")
-            parsed = None
-            try:
-                maybe = json.loads(body)
-                if isinstance(maybe, dict):
-                    parsed = maybe.get("data", maybe)
-                    if isinstance(parsed, str):
-                        parsed = {"title": ev.get("title", ""), "message": body}
-                    else:
-                        parsed = {"title": ev.get("title", ""), **parsed}
-            except json.JSONDecodeError:
-                parsed = {"title": ev.get("title", ""), "message": body}
-            await handle_event(client, st, topic, parsed)
-            save_state(st)
+            # with 块结束自动恢复上下文。直接 bind_from_event() 是不恢复的：
+            # main() 里那句 "stream error ... reconnect in 5s" 会挂上最后一条
+            # 消息的 trace，grep 那条消息时会捞到一堆无关的重连错误
+            # （pc_subscriber 已因同一个 bug 修过，这里是同一处漏网）。
+            with pclog.trace(pclog.extract_trace(ev)):
+                # fp-pc arrives as JSON string inside message (from listener);
+                # fp-gray is our gray JSON; fp-vps is plain text
+                body = ev.get("message", "")
+                parsed = None
+                try:
+                    maybe = json.loads(body)
+                    if isinstance(maybe, dict):
+                        parsed = maybe.get("data", maybe)
+                        if isinstance(parsed, str):
+                            parsed = {"title": ev.get("title", ""), "message": body}
+                        else:
+                            parsed = {"title": ev.get("title", ""), **parsed}
+                except json.JSONDecodeError:
+                    parsed = {"title": ev.get("title", ""), "message": body}
+                await handle_event(client, st, topic, parsed)
+                save_state(st)
 
 
 async def main():

@@ -73,12 +73,15 @@ def _publish(topic, title, message, priority=4, tags=None):
         "priority": priority,
         "tags": tags or ["rotating_light"],
     }).encode("utf-8")
-    p = subprocess.run(
-        ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-         "-H", f"Authorization: Bearer {NTFY_TOKEN}",
-         "-H", "Content-Type: application/json",
-         "-d", "@-", NTFY_URL],
-        input=payload, capture_output=True)
+    # curl 必须自带超时：这是唯一的采集侧组件，网络卡住会让整个监控主循环
+    # 停在 push 这一步（journalctl/systemctl/df 同样补了 timeout=30）。
+    # header 只在配置了 FP_NTFY_TOKEN 时才带。
+    cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+           "--max-time", "20"]
+    if NTFY_TOKEN:
+        cmd += ["-H", f"Authorization: Bearer {NTFY_TOKEN}"]
+    cmd += ["-H", "Content-Type: application/json", "-d", "@-", NTFY_URL]
+    p = subprocess.run(cmd, input=payload, capture_output=True, timeout=30)
     code = p.stdout.decode().strip()
     if code != "200":
         # never die on push failure; local spool as fallback
@@ -107,7 +110,7 @@ def check_oom(since_ts):
     # kernel OOM lines
     p = subprocess.run(
         ["journalctl", "-k", "--since", f"@{int(since_ts)}", "--no-pager"],
-        capture_output=True, text=True)
+        capture_output=True, text=True, timeout=30)
     kills = re.findall(
         r"Out of memory: Killed process .*?(\d+) \((.*?)\)", p.stdout)
     if kills:
@@ -120,7 +123,7 @@ def check_oom(since_ts):
         gray("oom-kill", {"pid": pid, "process": name})
 
 def check_disk():
-    p = subprocess.run(["df", "-P", "/"], capture_output=True, text=True)
+    p = subprocess.run(["df", "-P", "/"], capture_output=True, text=True, timeout=30)
     m = re.search(r"(\d+)%", p.stdout)
     if not m:
         return
@@ -140,7 +143,7 @@ def check_ssh_login(since_ts):
     p = subprocess.run(
         ["journalctl", "-u", "ssh", "--since", f"@{int(since_ts)}",
          "--no-pager", "-g", "Accepted (password|publickey)"],
-        capture_output=True, text=True)
+        capture_output=True, text=True, timeout=30)
     logins = re.findall(r"Accepted \S+ for (\S+) from (\S+)", p.stdout)
     for user, ip in logins:
         rec = {"user": user, "ip": ip}
@@ -164,7 +167,7 @@ def check_units():
     p = subprocess.run(
         ["systemctl", "list-units", "--state=failed", "--no-legend",
          "--no-pager", "--plain"],
-        capture_output=True, text=True)
+        capture_output=True, text=True, timeout=30)
     failed = [l.split()[0] for l in p.stdout.splitlines() if l.strip()]
     for unit in failed:
         base = unit.split(".")[0]
