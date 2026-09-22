@@ -87,7 +87,13 @@ def serve(client: paramiko.SSHClient):
     srv.listen(16)
     srv.settimeout(1.0)
     log(f"tunnel up: {LOCAL_HOST}:{LOCAL_PORT} -> vps:{REMOTE_PORT} (over ssh)")
-    beats = 0
+    # r8 P1-1：心跳按**墙钟**驱动，不按 accept 计数。原实现 beats 每次
+    # 成功 accept 就清零，而 watchdog.check_health 每 60s 必然新建连接
+    # （httpx keepalive_expiry=5s，连不上复用），健康状态下 beats 永远
+    # 到不了 300 —— 隧道日志整天零心跳，quiet 检查（1800s）必然误报：
+    # 2026-09-22 22:19:35 实际发出过一条假告警（报告 P1-1，每 30min 一对
+    # 假故障/假恢复）。改成「只要 serve 循环还在转，每 300s 无条件留一条」。
+    last_beat = time.time()
     try:
         while True:
             try:
@@ -95,17 +101,13 @@ def serve(client: paramiko.SSHClient):
             except socket.timeout:
                 if not transport.is_active():
                     raise ConnectionError("transport closed")
-                beats += 1
-                if beats % 300 == 0:
-                    # r7-10：隧道健康时可能长时间零日志（没连接就没输出），
-                    # 「serve 卡死」和「正常等待」在日志上同形。accept 超时是
-                    # 1s 一拍，每 300 拍（5min）留一条心跳，watchdog 的 quiet
-                    # 检查（阈值 1800s）才有判据。
-                    log(f"idle heartbeat: tunnel serving, transport="
-                        f"{'active' if transport.is_active() else 'DEAD'}")
-                continue
-            on_conn(conn, transport)
-            beats = 0
+            else:
+                on_conn(conn, transport)
+            now = time.time()
+            if now - last_beat >= 300:
+                last_beat = now
+                log(f"idle heartbeat: tunnel serving, transport="
+                    f"{'active' if transport.is_active() else 'DEAD'}")
     finally:
         srv.close()
 

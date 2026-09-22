@@ -355,9 +355,111 @@ def check_quiet() -> tuple[bool, str]:
     return True, "quiet 正常"
 
 
+# r8 P0-1：VPS 侧监控的存活与可达 —— PC 侧原来对它**零覆盖**。
+# VPS 的 fuckpush-monitor 死了/被停/token 失效时，PC 五项全绿、手机零告警，
+# 而它才是 OOM/磁盘/SSH 登录/unit 挂掉这些硬规则的唯一采集者 —— 典型的
+# 「最需要它的时刻它哑了，还没人知道」。
+VPS_CHECK_INTERVAL = 300   # SSH 探测 VPS 的最小间隔（结果缓存，别每 60s 都连）
+VPS_FAIL_TS_WINDOW = 900   # gray.log 最后一条 push-failed 多新才算「推送坏了」
+_vps_cache: dict = {"ts": 0.0, "ok": True, "detail": "vps 尚未首查"}
+
+
+def check_vps() -> tuple[bool, str]:
+    """VPS 监控存活 + 推送可达（每 VPS_CHECK_INTERVAL 秒真探一次，余下吃缓存）。
+
+    三种要抓的黑屏形态（第 8 轮报告 P0-1）：
+      1. fuckpush-monitor 持续死亡或持续崩溃循环 —— systemd 的
+         Restart=on-failure 兜得住瞬时崩溃，兜不住「起来就崩」（那种
+         is-active 会停在 activating，不算活）；
+      2. FP_NTFY_TOKEN 失效 -> _publish 恒 401 -> 只落它自己的 gray.log，
+         PC 的 health 用的是 PC 自己的 token、照常 200（2026-09-22 实测
+         两个 token 同值且都 200，此形态当下未发生，但没有机制能发现它
+         哪天发生 —— 这条检查就是那个机制）；
+      3. 崩溃循环的「启动 push」救不了场 —— 它会被 AI 判「忽略」静默归档，
+         再被 dedup 压 1800s。
+
+    判据与故障域切分：
+      - SSH 通 -> 看 systemctl is-active（active 才算活）+ gray.log 最后
+        一条是否为新近的 ntfy-push-failed（推送可达性，只报「已知坏」
+        不报「未知好」）；
+      - SSH 不通 -> 先探本地隧道：隧道通说明 VPS 活着、是本检查自己的
+        凭据/端口坏了（health 不会报这个）-> 红；隧道也不通则是整体网络
+        故障，health 必然也红 -> 这里返回绿让 health 去喊，避免同一
+        故障域双报（第 8 轮 P2-2 的告警风暴缺口）。
+    结果缓存 VPS_CHECK_INTERVAL 秒：一次 SSH 最多十几秒，不能每轮都拖。
+    """
+    now = time.time()
+    if now - _vps_cache["ts"] < VPS_CHECK_INTERVAL:
+        return _vps_cache["ok"], _vps_cache["detail"]
+
+    def _set(ok: bool, detail: str) -> tuple[bool, str]:
+        _vps_cache.update(ts=now, ok=ok, detail=detail)
+        return ok, detail
+
+    # 全程按 P1-2 的教训包住：这条检查自己绝不许抛（抛了会被主循环记成
+    # 「检查器异常」红 5 分钟，制造假告警）
+    try:
+        secret = HERE.parent / "vps.secret"
+        if not secret.exists():
+            return _set(False, "vps: vps.secret 缺失（无法探测 VPS 监控）")
+        host, port, user, pwd = secret.read_text().split()
+        import paramiko
+        cli = None
+        try:
+            cli = paramiko.SSHClient()
+            cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            cli.connect(host, port=int(port), username=user, password=pwd,
+                        timeout=10, banner_timeout=15, auth_timeout=10)
+            _, out, err = cli.exec_command(
+                "systemctl is-active fuckpush-monitor 2>/dev/null; echo ' --- '; "
+                "tail -1 /var/log/fuckpush/gray.log 2>/dev/null",
+                timeout=15)
+            text = out.read().decode("utf-8", "replace")
+        finally:
+            if cli is not None:
+                try:
+                    cli.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        # SSH 失败：先问隧道。隧道活着 -> 是本检查的凭据/端口坏了（health
+        # 永远不会报这个，必须这里红）；隧道也死 -> 网络故障域，交 health。
+        tunnel_ok = False
+        try:
+            tunnel_ok = httpx.get(f"{NTFY_BASE}/v1/health", timeout=5,
+                                  trust_env=False).status_code == 200
+        except Exception:
+            tunnel_ok = False
+        if tunnel_ok:
+            return _set(False, f"vps: SSH 探测失败(隧道却通,凭据/端口问题): "
+                               f"{type(e).__name__}: {e}")
+        return _set(True, "vps: SSH 与隧道都不通=网络故障域，由 health 覆盖")
+
+    active_part, _, gray_part = text.partition(" --- ")
+    active = active_part.strip()
+    if active != "active":
+        return _set(False, f"vps: fuckpush-monitor 状态={active or '空'}"
+                           f"（持续崩溃或被停，硬规则告警全发不出）")
+
+    # gray.log 最后一条是新近的 ntfy-push-failed -> token 失效/ntfy 拒收
+    gray_line = gray_part.strip().splitlines()
+    if gray_line:
+        try:
+            last = json.loads(gray_line[-1])
+            if (last.get("kind") == "ntfy-push-failed"
+                    and now - float(last.get("ts", 0)) < VPS_FAIL_TS_WINDOW):
+                data = last.get("data") or {}
+                return _set(False, "vps: 推送被拒 http="
+                           f"{data.get('http_code')}（token 失效或 ntfy 拒收，"
+                           f"VPS 硬规则发不出去，只落了它本地 gray.log）")
+        except Exception:
+            pass    # 尾行不是 JSON/时间戳坏 -> 不据此判红，is-active 已覆盖
+    return _set(True, "vps: monitor active 且无新推送失败")
+
+
 CHECKS = [("health", check_health), ("procs", check_procs),
           ("link", check_link), ("disk", check_disk),
-          ("quiet", check_quiet)]
+          ("quiet", check_quiet), ("vps", check_vps)]
 
 
 def _elapsed(now: float, then: float) -> float:
@@ -373,6 +475,12 @@ def _elapsed(now: float, then: float) -> float:
 
 
 # ------------------------------------------------- 告警通道（独立于隧道）
+def _cut(s: str, n: int) -> str:
+    """r8 P2-7：截断必须留标记。原来 message[:900] 悄悄砍掉「影响/排查」
+    的尾巴，收的人看不出被截 —— 照着半截指引排查只会浪费时间。"""
+    return s if len(s) <= n else s[:n - 8] + "…(已截断)"
+
+
 def _ntfy_payload(title: str, message: str) -> dict:
     # 告警自带一个新 trace，但必须用 with 恢复 —— 直接 set_trace_id(None)
     # 会把 trace 留在上下文里，之后的心跳日志全都挂上最后一次告警的 id，
@@ -380,8 +488,8 @@ def _ntfy_payload(title: str, message: str) -> dict:
     with pclog.trace(None):
         return {
             "topic": "fp-phone",
-            "title": title[:120],
-            "message": message[:900],
+            "title": _cut(title, 120),
+            "message": _cut(message, 900),
             "priority": 4,                 # hard rule: high, 不经 AI
             "tags": pclog.tags_with_trace(["bell", "rotating_light"]),
         }
@@ -393,6 +501,15 @@ def push_local(payload: dict) -> bool:
         r = httpx.post(f"{NTFY_BASE}/", json=payload,
                        headers={"Authorization": f"Bearer {_token()}"},
                        timeout=8, trust_env=False)
+        # r8 P1-3③：记下服务端分配的 message id —— 「已送达」原来只证明
+        # 收到 200，事后想和手机端对账（到底推的哪条）没有抓手。
+        if r.status_code == 200:
+            try:
+                mid = (r.json() or {}).get("id")
+                if mid:
+                    LOG.info(f"alert message id={mid} title={payload.get('title', '')[:60]}")
+            except Exception:
+                pass    # 响应体解析失败不影响送达判定
         return r.status_code == 200
     except Exception as e:
         LOG.warning(f"local alert channel failed: {e!r}")
@@ -405,16 +522,24 @@ def push_vps(payload: dict) -> bool:
     payload 走 base64：JSON 里有中文和引号，塞进 shell 命令会被转义啃掉，
     base64 全 ASCII 就没这问题；VPS 端用 curl -d @file 读，零转义。
     """
-    secret = HERE.parent / "vps.secret"
-    if not secret.exists():
-        LOG.error("vps.secret 不存在，无法走 SSH 兜底")
-        return False
-    host, port, user, pwd = secret.read_text().split()
-    import paramiko
-
-    cli = paramiko.SSHClient()
-    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    # r8 P1-2：secret 解包 / import paramiko / SSHClient 构造原来在 try
+    # **之外** —— vps.secret 被改坏（字段数≠4 抛 ValueError）、AV 瞬间拒读
+    # （OSError）、paramiko 导入失败，且同时本地隧道不可用（正是要走第二层
+    # 的时刻）时，异常沿 push_vps → send_alert → main 冒出，excepthook 再
+    # 调 send_alert 撞同一异常被 except 吞掉，**第三层 toast 根本没机会
+    # 执行** → watchdog os._exit，监控整体停摆 —— 复刻 17:21「最该报警时
+    # 一条都没送出去」。全部收进 try。
+    cli = None
     try:
+        secret = HERE.parent / "vps.secret"
+        if not secret.exists():
+            LOG.error("vps.secret 不存在，无法走 SSH 兜底")
+            return False
+        host, port, user, pwd = secret.read_text().split()
+        import paramiko
+
+        cli = paramiko.SSHClient()
+        cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         cli.connect(host, port=int(port), username=user, password=pwd,
                     timeout=15, banner_timeout=20, auth_timeout=20)
         b64 = base64.b64encode(
@@ -447,10 +572,11 @@ def push_vps(payload: dict) -> bool:
         LOG.error(f"vps alert channel failed: {e!r}")
         return False
     finally:
-        try:
-            cli.close()
-        except Exception:
-            pass
+        if cli is not None:      # r8 P1-2：构造阶段就异常时 cli 还是 None
+            try:
+                cli.close()
+            except Exception:
+                pass
 
 
 def _record_echo(title: str, message: str) -> None:
@@ -507,7 +633,7 @@ def push_toast(title: str, message: str) -> bool:
         "$n.Show([Windows.UI.Notifications.ToastNotification]::new($x)); "
         "Write-Output 'SHOWN'"
     )
-    env = {**os.environ, "FP_T": title[:120], "FP_M": message[:900]}
+    env = {**os.environ, "FP_T": _cut(title, 120), "FP_M": _cut(message, 900)}
     try:
         # 同步等退出码：Popen 不等待的话，「弹失败了」和「弹成功」在日志里
         # 长得一模一样，等于这条通道没有可观测性。
@@ -519,6 +645,10 @@ def push_toast(title: str, message: str) -> bool:
         out = (p.stdout or "").strip()
         if p.returncode == 0 and "SHOWN" in out:
             _record_echo(title, message)   # 别让 listener 把这条告警再推一遍
+            # r8 P1-3②：SHOWN 只证明 PowerShell 把通知**提交**给了通知中心，
+            # 不证明用户看见 —— 勿扰/专注模式会静默吞掉它。日志措辞降级，
+            # 免得事后拿「已送达」当「已看到」的证据。
+            LOG.info("toast 已提交给通知中心（未证实显示；勿扰/专注模式会静默吞掉）")
             return True
         LOG.error(f"toast channel failed: rc={p.returncode} "
                   f"stderr={(p.stderr or '').strip()[:300]!r}")
@@ -534,18 +664,73 @@ def send_alert(title: str, message: str) -> bool:
     前两条共享「外部网络」故障域（17:21 实测同时挂），toast 只碰本机 ——
     三条里至少有一条在任何网络状态下都可用。
     """
-    payload = _ntfy_payload(title, message)
-    if push_local(payload):
-        LOG.info(f"告警已送达(本地隧道) {title}")
-        return True
-    if push_vps(payload):
-        LOG.info(f"告警已送达(VPS-SSH兜底) {title}")
-        return True
-    if push_toast(title, message):
-        LOG.info(f"告警已送达(本机toast，两条网络通道都失败) {title}")
-        return True
+    # r8 P1-2：每层各自 try —— push_local/push_vps/push_toast 内部虽有
+    # 兜底，但 _ntfy_payload 的 pclog.trace/tags、以及未来任何一层的新增
+    # 代码抛异常，都会让后面的层**永远没机会执行**（尤其 toast 这条零网络
+    # 最后防线）。一层失败只降级，绝不击穿整条链。
+    payload = None
+    try:
+        payload = _ntfy_payload(title, message)
+    except Exception as e:
+        LOG.error(f"alert payload build failed: {e!r}")
+    if payload is not None:
+        try:
+            if push_local(payload):
+                LOG.info(f"告警已送达(本地隧道) {title}")
+                return True
+        except Exception as e:
+            LOG.error(f"local alert channel raised: {e!r}")
+        try:
+            if push_vps(payload):
+                LOG.info(f"告警已送达(VPS-SSH兜底) {title}")
+                return True
+        except Exception as e:
+            LOG.error(f"vps alert channel raised: {e!r}")
+    try:
+        if push_toast(title, message):
+            LOG.info(f"告警已送达(本机toast，两条网络通道都失败) {title}")
+            return True
+    except Exception as e:
+        LOG.error(f"toast channel raised: {e!r}")
     LOG.error(f"告警三条通道都失败！{title}")
     return False
+
+
+# r8 P1-3①：端到端金丝雀。三层告警的「已送达」都只证明**ntfy 服务端收了
+# 200**，手机 App 是否还在订阅、有没有被 doze/卸载/退订，任何一层都自证
+# 不了 —— 只能靠一条固定节奏、固定标题的 priority=1（最低档，不响铃）消息，
+# 人眼核对「今天这条到没到」。间隔 24h：每天一条，缺了=最后一跳断了。
+CANARY_INTERVAL = 24 * 3600
+CANARY_TITLE = "[FxxkPush] 链路自检"
+
+
+def send_canary() -> bool:
+    """发一条 canary；失败不风暴，由主循环按 CANARY_INTERVAL 节奏驱动。
+
+    走 send_alert 全链（local -> vps -> toast）：canary 本身也是对三层降级
+    的日常演练。payload 用 priority=1（最低档，只入列不响铃）。
+    """
+    try:
+        payload = _ntfy_payload(CANARY_TITLE,
+                                "金丝雀：手机最后一跳是否可达，看这条。"
+                                "固定每 24h 一条；哪天没收到 = App 退订/被杀/"
+                                "勿扰吞了通知。")
+        payload["priority"] = 1     # 最低档：能入列就行，别响铃
+        if push_local(payload):
+            LOG.info("canary 已送达(本地隧道)")
+            return True
+        if push_vps(payload):
+            LOG.info("canary 已送达(VPS-SSH兜底)")
+            return True
+        if push_toast(CANARY_TITLE,
+                      "canary：两条网络通道都失败（本机 toast 兜底）"):
+            LOG.warning("canary 仅本机 toast（网络通道全失败，本身即故障信号）")
+            return True
+        LOG.error("canary 三条通道都失败")
+        return False
+    except Exception as e:
+        LOG.error(f"canary 异常: {e!r}")
+        return False
 
 
 # ---------------------------------------------------------------- 主循环
@@ -561,10 +746,21 @@ def main() -> int:
     cycle = 0
 
     last_revive: dict[str, float] = {}   # svc -> 上次自动拉起时间
+    # r8 P1-3①：启动即发第一条 canary（人工立刻能核对「手机收得到吗」），
+    # 之后每 CANARY_INTERVAL 一条。失败置 0 -> 下一轮（60s）重试，但成功后
+    # 才打时间戳，所以失败风暴上限是 1 次/分钟且三层全挂时本就是故障态。
+    last_canary = 0.0
 
     while True:
         cycle += 1
         now = time.time()
+        # r8 P2-15：_elapsed 钳制 —— 时钟回拨后 now-last_canary 为负，
+        # 裸比较会让金丝雀永久哑掉；钳制成 inf = 立即再发一条，多发无害。
+        if _elapsed(now, last_canary) >= CANARY_INTERVAL:
+            if send_canary():
+                last_canary = now
+            else:
+                LOG.error("canary 发送失败，60s 后重试")
         healthy_now = 0
         health_ok = False
         for name, fn in CHECKS:
@@ -578,20 +774,24 @@ def main() -> int:
                 if name == "health":
                     health_ok = True
                 if name in fault_since:
-                    dur = _elapsed(now, fault_since.pop(name))
-                    if dur == float("inf"):
-                        dur = 0.0     # 时间回拨：按「刚恢复」展示，别报负数
-                    LOG.info(f"{name} 恢复（故障持续 {fmt_dur(dur)}）")
-                    if name in last_alert:
-                        # 告警过就告知恢复，否则静默（没打扰过就别吵）。
-                        # r7-13：原来忽略 send_alert 返回值、无条件 pop ——
-                        # 三条通道全失败时（17:21 形态）「已恢复」永久丢失，
-                        # 用户只看到故障没看到恢复。失败就留着，下一轮重试。
-                        if send_alert(f"[FxxkPush] {name} 已恢复",
-                                      f"故障持续 {fmt_dur(dur)} 后恢复正常。\n{detail}"):
-                            last_alert.pop(name, None)
-                        else:
-                            LOG.error(f"恢复通知发送失败，下一轮重试: {name}")
+                    # r8 P1-2：与告警段同理，恢复通知的组装/发送也整体隔离
+                    try:
+                        dur = _elapsed(now, fault_since.pop(name))
+                        if dur == float("inf"):
+                            dur = 0.0     # 时间回拨：按「刚恢复」展示，别报负数
+                        LOG.info(f"{name} 恢复（故障持续 {fmt_dur(dur)}）")
+                        if name in last_alert:
+                            # 告警过就告知恢复，否则静默（没打扰过就别吵）。
+                            # r7-13：原来忽略 send_alert 返回值、无条件 pop ——
+                            # 三条通道全失败时（17:21 形态）「已恢复」永久丢失，
+                            # 用户只看到故障没看到恢复。失败就留着，下一轮重试。
+                            if send_alert(f"[FxxkPush] {name} 已恢复",
+                                          f"故障持续 {fmt_dur(dur)} 后恢复正常。\n{detail}"):
+                                last_alert.pop(name, None)
+                            else:
+                                LOG.error(f"恢复通知发送失败，下一轮重试: {name}")
+                    except Exception as e:
+                        LOG.error(f"恢复通知段异常(已隔离): {name} {e!r}")
                 continue
 
             # 不健康
@@ -605,28 +805,38 @@ def main() -> int:
             prev = last_alert.get(name, 0)
             if _elapsed(now, prev) < RENOTIFY:
                 continue
-            started = datetime.fromtimestamp(start).strftime("%Y-%m-%d %H:%M:%S")
-            msg = (f"检查项: {name}\n"
-                   f"详情: {detail}\n"
-                   f"已持续: {fmt_dur(dur)}（阈值 {FAIL_MIN} 分钟）\n"
-                   f"首次发现: {started}\n"
-                   f"影响: {'全链路推送中断' if name == 'health' else '对应服务不可用'}\n"
-                   f"排查: pc/logs/*.log")
-            LOG.error(f"告警 {name}: {detail}")
-            # P2-7：只有**真送出去**才记 last_alert。原实现在 send_alert
-            # 之前就打时间戳 —— 三条通道同时失败时（17:21 事故形态）同一
-            # 故障 1800s 内不再尝试，最坏把整轮告警全丢掉。失败就下一轮
-            # （60s 后）立刻重试。
-            if send_alert(f"[FxxkPush] {name} 故障 {fmt_dur(dur)}", msg):
-                last_alert[name] = now
-            else:
-                LOG.error(f"告警发送失败，下一轮重试: {name}")
+            try:
+                started = datetime.fromtimestamp(start).strftime("%Y-%m-%d %H:%M:%S")
+                msg = (f"检查项: {name}\n"
+                       f"详情: {detail}\n"
+                       f"已持续: {fmt_dur(dur)}（阈值 {FAIL_MIN} 分钟）\n"
+                       f"首次发现: {started}\n"
+                       f"影响: {'全链路推送中断' if name == 'health' else '对应服务不可用'}\n"
+                       f"排查: pc/logs/*.log")
+                LOG.error(f"告警 {name}: {detail}")
+                # P2-7：只有**真送出去**才记 last_alert。原实现在 send_alert
+                # 之前就打时间戳 —— 三条通道同时失败时（17:21 事故形态）同一
+                # 故障 1800s 内不再尝试，最坏把整轮告警全丢掉。失败就下一轮
+                # （60s 后）立刻重试。
+                if send_alert(f"[FxxkPush] {name} 故障 {fmt_dur(dur)}", msg):
+                    last_alert[name] = now
+                else:
+                    LOG.error(f"告警发送失败，下一轮重试: {name}")
+            except Exception as e:
+                # r8 P1-2：msg 组装/send_alert 外围的任何异常都不许穿透
+                # 到主循环 —— 一次 datetime 转换失败就让监控停摆是不可接受的。
+                LOG.error(f"告警段异常(已隔离, 下一轮重试): {name} {e!r}")
 
         # P1-1：隧道是通的才自动拉起死掉的服务 —— 和 start_services 的健康门
         # 同一条哲学：隧道没就绪时把它们全拉起来，只会对着 2586 空转刷错
         # （v0.3.0 之前那次启动顺序事故的形态），健康门失败时尤其不能补刀。
         if health_ok:
-            revive_dead(now, last_revive)
+            # r8 P1-2：revive_dead 里有 Popen/psutil/文件读写，异常不能
+            # 带走整个巡检循环（excepthook → send_alert 再炸就直接停摆）。
+            try:
+                revive_dead(now, last_revive)
+            except Exception as e:
+                LOG.error(f"revive_dead 异常(已隔离): {e!r}")
 
         # 心跳：全绿时也留痕迹，否则 watchdog 静默运行时分不清它是健康还是已经死了
         if healthy_now == len(CHECKS) and cycle % HEARTBEAT_CYCLES == 0:
