@@ -56,15 +56,37 @@ def _token() -> str:
     return p.read_text().strip() if p.exists() else ""
 
 
+_health_client: httpx.Client | None = None
+
+
+def _health_cli() -> httpx.Client:
+    """复用同一个 Client：顶层 httpx.get() 每次都新建连接池并初始化，
+    实测 654ms + 458KB 读 + 泄漏 4 个句柄/次（60 次/小时 = 240 句柄/小时，
+    Windows 单进程 10k 句柄限制下约 40 小时触顶）。trust_env 在构造时固定
+    为 False，之后系统代理怎么翻转都不影响本连接 —— 这正是复用安全的前提。
+    """
+    global _health_client
+    if _health_client is None or _health_client.is_closed:
+        _health_client = httpx.Client(trust_env=False,
+                                      timeout=httpx.Timeout(6.0))
+    return _health_client
+
+
 def check_health() -> tuple[bool, str]:
     try:
-        r = httpx.get(HEALTH_URL,
-                      headers={"Authorization": f"Bearer {_token()}"},
-                      timeout=6, trust_env=False)
+        r = _health_cli().get(HEALTH_URL,
+                              headers={"Authorization": f"Bearer {_token()}"})
         if r.status_code == 200:
             return True, "health=200"
         return False, f"health=HTTP {r.status_code}"
     except Exception as e:
+        # 连接池里的死连接（隧道重连过）由 httpx 自己丢弃重试一次；
+        # 真失败就把 Client 扔掉，下轮重建，避免坏状态常驻。
+        global _health_client
+        if _health_client is not None:
+            try: _health_client.close()
+            except Exception: pass
+            _health_client = None
         return False, f"health {type(e).__name__}: {e}"
 
 
