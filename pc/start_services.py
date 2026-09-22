@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 import httpx
+import psutil
 
 HERE = Path(__file__).parent
 PYW = HERE.parent / ".venv" / "Scripts" / "pythonw.exe"
@@ -48,50 +49,58 @@ def _token() -> str:
     return p.read_text().strip() if p.exists() else ""
 
 
-def _ours_only(filter_out_self: bool = True) -> str:
-    """PowerShell 片段：只认本项目的 pythonw，不碰 Hermes/其它 pythonw。
+def _our_procs(include_self: bool = True) -> list[tuple[int, str]]:
+    """[(pid, cmdline), ...] 本项目的 pythonw（shim + 真身都算）。
 
-    老 bat 用 `taskkill /F /IM pythonw.exe` 一刀切，会连 Hermes 的解释器
-    一起杀。按 CommandLine 过滤才是只动自己。
+    psutil 而非 PowerShell：子进程会弹控制台窗口（pythonw 父进程无控制台时），
+    且进程内遍历约 15ms，PowerShell 冷启动要 1-5 秒。
+    process_iter 只取 name（便宜），cmdline 单独对 pythonw 取 —— 全量取 cmdline
+    是 2 秒级，对全系统几百个进程都开一遍句柄。
     """
-    cond = "$_.CommandLine -like '*fuckpush\\pc\\*'"
-    if filter_out_self:
-        cond += " -and $_.CommandLine -notlike '*start_services*'"
-    return cond
+    out = []
+    for proc in psutil.process_iter(["name"]):
+        try:
+            if (proc.info.get("name") or "").lower() != "pythonw.exe":
+                continue
+            try:
+                cmd = " ".join(proc.cmdline() or [])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            low = cmd.lower()
+            if "fuckpush\\pc\\" not in low:
+                continue          # 只动自己，Hermes 等其它 pythonw 不碰
+            if not include_self and "start_services" in low:
+                continue          # 不杀自己
+            out.append((proc.pid, cmd))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return out
 
 
 def kill_ours() -> list[str]:
-    """杀掉本项目全部 pythonw（shim + 真身）。返回未退出的残留列表。"""
-    ps = (f"Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" | "
-          f"Where-Object {{ {_ours_only()} }} | "
-          f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}")
-    r = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps],
-                       capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", timeout=30)
-    if r.returncode != 0:
-        LOG.error(f"杀进程失败: {r.stderr.strip()[:200]}")
+    """杀掉本项目全部 pythonw（shim + 真身）。返回未退出的残留 cmdline。"""
+    procs = _our_procs(include_self=False)
+    if procs:
+        LOG.info(f"终止 {len(procs)} 个旧进程")
+    for pid, _ in procs:
+        try:
+            psutil.Process(pid).kill()
+        except psutil.Error as e:
+            LOG.warning(f"kill pid={pid} failed: {e!r}")
     # 等进程真的退出，否则新旧同脚本并存会双写日志
     for _ in range(20):
-        if not list_ours():
+        if not _our_procs(include_self=False):
             break
         time.sleep(0.3)
-    left = list_ours()
+    left = _our_procs(include_self=False)
     if left:
         LOG.warning(f"仍有 {len(left)} 个残留进程未退出")
-    return left
+    return [c for _, c in left]
 
 
 def list_ours() -> list[str]:
-    """返回本项目 pythonw 的 CommandLine 列表。"""
-    ps = (f"Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" | "
-          f"Where-Object {{ {_ours_only(filter_out_self=False)} }} | "
-          f"Select-Object -ExpandProperty CommandLine")
-    r = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps],
-                       capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", timeout=30)
-    if r.returncode != 0:
-        return []
-    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    """返回本项目 pythonw 的 cmdline 列表（含 start_services 自己）。"""
+    return [c for _, c in _our_procs(include_self=True)]
 
 
 def start(script: str) -> None:
