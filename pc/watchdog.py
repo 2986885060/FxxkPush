@@ -58,6 +58,22 @@ PYW = HERE.parent / ".venv" / "Scripts" / "pythonw.exe"   # 和 start_services �
 REVIVE_INTERVAL = 300     # 同一服务 5 分钟内只自动拉起一次（防拉起风暴）
 DISK_PCT = 90             # 磁盘使用率告警阈值（VPS 侧同值）
 HB = LOG_DIR / "watchdog.hb"   # 每轮心跳时间戳，给 notification_listener 交叉检查
+_START_TS = time.time()        # 本进程启动时刻（r7-1：开机宽限期用）
+REVIVE_GRACE = 300             # 起来后 5 分钟内禁止 revive —— 开机时 6 个
+                               # HKCU Run 独立启动、首轮枚举/日志都没稳定，
+                               # 这时候补刀最容易造出双份进程
+
+# 各服务日志「安静多久算可疑」（秒）。它们的节奏完全不同：listener 事件驱动
+# （+5min 心跳行）、triager/subscriber/tunnel 5min 心跳行、wechat 30min 一轮
+# （夜间 10min 一行）。统一按 120s 判会把长轮询服务永久判成「有动静」或
+# 把正常静默判成故障（r7-1/r7-2 的判据缺口，各服务已配对应心跳行）。
+LOG_QUIET = {
+    "ntfy_tunnel": 1800,
+    "pc_subscriber": 900,
+    "notification_listener": 900,
+    "ai_triager": 900,
+    "wechat_vision": 2700,      # 30min 轮 + 扫描耗时，留 15min 余量
+}
 
 # 脚本名 -> pclog 服务名（日志文件名）。wechat 的日志叫 wechat_vision.log，
 # 和脚本名不一致，映射一次省得两处各写一遍。
@@ -140,15 +156,19 @@ def _our_pythons() -> list[str]:
 
 
 def _counts() -> tuple[dict[str, int], int]:
-    """{脚本名: 进程数}, 枚举到的本项目 pythonw 总数。"""
+    """{脚本名: 进程数}, 5 个被监控服务的枚举总数（**不含 watchdog 自己**）。
+
+    r7-1：原来 total 把 watchdog 自身 2 个进程也算进去，revive 的第一道闸
+    「total == 0 才可信」永远 >= 2 —— 该闸实际不可达。现在总枚举数只统计
+    WATCHED，「连自己都看得见」改由 revive 里单独检查（那是枚举是否被
+    权限/AV 挡住的真探针）。
+    """
     counts: dict[str, int] = {}
-    total = 0
     for cl in _our_pythons():
         m = re.search(r"([a-z_]+\.py)", cl)
         if m:
             counts[m.group(1)] = counts.get(m.group(1), 0) + 1
-            total += 1
-    return counts, total
+    return counts, sum(counts.get(s, 0) for s in WATCHED)
 
 
 def check_procs() -> tuple[bool, str]:
@@ -182,23 +202,31 @@ def _log_fresh(stem: str, secs: float) -> bool:
 def revive_dead(now: float, last_revive: dict) -> None:
     """P1-1：进程死了要拉起来，不能只发一条告警等人回办公室。
 
-    三条保守闸门，每条都是为了不制造比原故障更糟的双份进程：
-    1. 只在计数 **恰为 0** 时动手 —— 计数 1 可能是 shim 正在派生真身
+    四道保守闸门（r7-1 修订），每条都是为了不制造比原故障更糟的双份进程：
+    0. 本进程起来 5 分钟内不动手 —— 开机时 6 个 HKCU Run 各自独立启动、
+       无编排，首轮枚举早于某些服务写出首行日志，这时「计数 0 + 日志静默」
+       是必然状态而不是故障信号。
+    1. **连 watchdog 自己都枚举不到**（counts 里没有 watchdog.py）才认为
+       枚举被权限/安全软件挡住、0 不可信 —— 这才是「枚举是否可靠」的真探针。
+       （原来的「total==0」把 watchdog 自己算进 total，恒 >=2，该闸不可达。）
+    2. 只在计数 **恰为 0** 时动手 —— 计数 1 可能是 shim 正在派生真身
        （秒级），这时再起一份必然变成 3-4 个；计数 1 交给 check_procs 报警。
-    2. 枚举总数为 0 时不动手 —— 那多半是权限/安全软件把 cmdline 全挡了，
-       服务其实活着，按「全死」重启会造出双份。
-    3. 该服务日志 2 分钟内还有动静也不动手 —— 同样是「枚举漏了它」的信号。
+    3. 该服务日志在**它自己的节奏窗口**内有动静就不动手（LOG_QUIET，
+       120s 一刀切会把 30min 一轮的 wechat / 事件驱动的 listener 永久判成
+       「有动静」= 永远不拉起）。
     同一服务 5 分钟内只重试一次，防止拉起失败变成每轮一次的进程风暴。
     """
-    counts, total = _counts()
-    if total == 0:
+    if time.time() - _START_TS < REVIVE_GRACE:
         return
+    counts, _ = _counts()
+    if counts.get("watchdog.py", 0) == 0:
+        return          # 枚举不可靠（连自己都看不见）
     for svc in WATCHED:
         if counts.get(svc, 0) != 0:
             continue
-        if _log_fresh(LOG_STEM[svc], 120):
+        if _log_fresh(LOG_STEM[svc], LOG_QUIET[LOG_STEM[svc]]):
             continue
-        if now - last_revive.get(svc, 0) < REVIVE_INTERVAL:
+        if _elapsed(now, last_revive.get(svc, 0)) < REVIVE_INTERVAL:
             continue
         last_revive[svc] = now
         try:
@@ -258,14 +286,20 @@ def check_link() -> tuple[bool, str]:
         if not lines:
             continue
         errs = oks = 0
+        err_secs: set[int] = set()
         for ln in lines:
             ts = _log_ts(ln)
             if ts is None or now - ts > LINK_ERR_MIN:
                 continue
             if _ERR_PAT.search(ln):
-                errs += 1
-            elif "[INFO" in ln or "[WARN" in ln:
+                # r7-2：一次异常的多行 traceback 逐行计入的话，单次异常就
+                # 瞬间满足 errs>=3。同一秒的多行 = 同一次异常，算 1 条。
+                err_secs.add(int(ts))
+            elif "[INFO" in ln:
+                # r7-2：[WARN] 不算「正常」—— 慢速重试刷 WARN 时 oks 被灌大，
+                # errs<oks 恒绿，真正的错误被压住。
                 oks += 1
+        errs = len(err_secs)
         if errs >= LINK_ERR_THRESHOLD and (oks == 0 or errs >= oks):
             suspects.append(f"{stem}: {errs} 条错误/{oks} 条正常"
                             f"（近 {LINK_ERR_MIN//60}min）")
@@ -290,8 +324,52 @@ def check_disk() -> tuple[bool, str]:
     return True, f"disk {pct}%"
 
 
+def check_quiet() -> tuple[bool, str]:
+    """r7-2/r7-10：反向判据 ——「活着但没干活」和「日志写不进去」。
+
+    check_link 只在**错误很多**时判红，纯静默（进程活着、零输出、日志文件
+    缺失/轮转失败后写不进去）恒绿 —— 正是 P0-1 想抓的静默停摆形态留下的
+    一半缺口。各服务已配周期心跳行（listener/triager/subscriber/tunnel 每
+    5min、wechat 每轮/夜间每 10min），超过 LOG_QUIET 没写任何东西 = 心跳断了。
+    刚启动时不判（日志还没首行）。
+    """
+    if time.time() - _START_TS < REVIVE_GRACE:
+        return True, "quiet 启动宽限期"
+    suspects = []
+    for stem, budget in LOG_QUIET.items():
+        p = LOG_DIR / f"{stem}.log"
+        if not p.exists():
+            suspects.append(f"{stem}: 日志文件缺失")
+            continue
+        last = None
+        for ln in reversed(pclog.read_tail(p, 5)):
+            last = _log_ts(ln)
+            if last is not None:
+                break
+        if last is None:
+            suspects.append(f"{stem}: 日志解析不出时间戳")
+        elif time.time() - last > budget:
+            suspects.append(f"{stem}: 静默 {int(time.time() - last)}s > {budget}s")
+    if suspects:
+        return False, "quiet " + "; ".join(suspects)
+    return True, "quiet 正常"
+
+
 CHECKS = [("health", check_health), ("procs", check_procs),
-          ("link", check_link), ("disk", check_disk)]
+          ("link", check_link), ("disk", check_disk),
+          ("quiet", check_quiet)]
+
+
+def _elapsed(now: float, then: float) -> float:
+    """r7-8：墙钟差值钳制。NTP/手动把系统时间往回拨几小时后，now-then 变负 ——
+    故障 dur 永远到不了 FAIL_MIN（永不告警）、last_alert 落在未来让
+    now-prev<RENOTIFY 恒真（告警被永久静音）、last_revive 同理（该服务
+    永久不再被拉起）。差值为负一律按「已过期/刚发生」处理：让判定继续走，
+    最多多告警一次，好过无声失效。日志时间戳与墙钟同步回拨，这里挡不住，
+    但那只会让下一轮巡检用同一套新时间重算（自洽）。
+    """
+    d = now - then
+    return d if d >= 0 else float("inf")
 
 
 # ------------------------------------------------- 告警通道（独立于隧道）
@@ -382,12 +460,21 @@ def _record_echo(title: str, message: str) -> None:
     不记的话，watchdog 自己弹的告警 toast 会被 listener 当成新通知重新入队
     分诊 —— 实测 18:17/18:18 有两条 ``PUSH [?] FxxkPush watchdog 通道测试``；
     断网期间还会变成每 30 分钟一条必失败的 PUSH_FAIL，恢复后再补推一条过期
-    的「已恢复」。复用 pc_subscriber.record_echo（同一个文件、同一格式），
-    导入失败只降级成日志：回环指纹缺失的后果由 listener 侧兜底。
+    的「已恢复」。
+
+    r7-7：**不能** import pc_subscriber 来复用它的 record_echo —— 模块导入
+    会执行 get_logger("pc_subscriber")，watchdog 进程从此长期持有
+    pc_subscriber.log（347KB，最吵的那个）的 RotatingFileHandler；Windows 下
+    rename 需要另一进程先关闭句柄，谁先轮转谁 PermissionError，被
+    logging.handleError 静默吞掉 —— 该日志的 2MBx3 上限实际失效、无限增长。
+    这里按同一格式（同一文件、同一字段）直接写，不再连带 import。
     """
     try:
-        from pc_subscriber import record_echo
-        record_echo(title, message)
+        pclog.append_rotating(
+            HERE / "toast_echo.jsonl",
+            json.dumps({"ts": time.time(), "title": (title or "").strip(),
+                        "msg": (message or "").strip()}, ensure_ascii=False),
+            max_bytes=256 * 1024, mode="tail")
     except Exception as e:
         LOG.warning(f"record echo failed (listener may re-triage this toast): {e!r}")
 
@@ -491,25 +578,32 @@ def main() -> int:
                 if name == "health":
                     health_ok = True
                 if name in fault_since:
-                    dur = now - fault_since.pop(name)
+                    dur = _elapsed(now, fault_since.pop(name))
+                    if dur == float("inf"):
+                        dur = 0.0     # 时间回拨：按「刚恢复」展示，别报负数
                     LOG.info(f"{name} 恢复（故障持续 {fmt_dur(dur)}）")
                     if name in last_alert:
-                        # 告警过就告知恢复，否则静默（没打扰过就别吵）
-                        send_alert(f"[FxxkPush] {name} 已恢复",
-                                   f"故障持续 {fmt_dur(dur)} 后恢复正常。\n{detail}")
-                        last_alert.pop(name, None)
+                        # 告警过就告知恢复，否则静默（没打扰过就别吵）。
+                        # r7-13：原来忽略 send_alert 返回值、无条件 pop ——
+                        # 三条通道全失败时（17:21 形态）「已恢复」永久丢失，
+                        # 用户只看到故障没看到恢复。失败就留着，下一轮重试。
+                        if send_alert(f"[FxxkPush] {name} 已恢复",
+                                      f"故障持续 {fmt_dur(dur)} 后恢复正常。\n{detail}"):
+                            last_alert.pop(name, None)
+                        else:
+                            LOG.error(f"恢复通知发送失败，下一轮重试: {name}")
                 continue
 
             # 不健康
             start = fault_since.setdefault(name, now)
-            dur = now - start
+            dur = max(0.0, now - start)   # r7-8：回拨后为负 -> 视为刚发现
             if dur < FAIL_MIN * 60:
                 LOG.warning(f"{name} 不健康 {fmt_dur(dur)}（阈值 {FAIL_MIN}min）: {detail}")
                 continue
 
             # 超过阈值：告警（同一故障最多每 RENOTIFY 秒重复一次）
             prev = last_alert.get(name, 0)
-            if now - prev < RENOTIFY:
+            if _elapsed(now, prev) < RENOTIFY:
                 continue
             started = datetime.fromtimestamp(start).strftime("%Y-%m-%d %H:%M:%S")
             msg = (f"检查项: {name}\n"
@@ -539,6 +633,12 @@ def main() -> int:
             names = "/".join(n for n, _ in CHECKS)
             LOG.info(f"heartbeat: {len(CHECKS)}/{len(CHECKS)} 检查通过 "
                      f"({names}) 第{cycle}轮")
+        elif cycle % HEARTBEAT_CYCLES == 0:
+            # r7-10：非全绿也留心跳 —— 否则「巡检在跑但有项红着」和
+            #「巡检卡死」在日志里同形，只能靠翻上一条 ERROR 猜。
+            red = [n for n, _ in CHECKS if n in fault_since]
+            LOG.warning(f"heartbeat: {len(CHECKS) - len(red)}/{len(CHECKS)} "
+                        f"通过，红={red} 第{cycle}轮")
 
         # P0-2：每轮落一个心跳时间戳。watchdog 不在 WATCHED 里（它没法自己
         # 监控自己），日志里那句 heartbeat 也没有任何消费者 —— 它一死，三项

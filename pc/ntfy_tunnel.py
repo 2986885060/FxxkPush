@@ -87,6 +87,7 @@ def serve(client: paramiko.SSHClient):
     srv.listen(16)
     srv.settimeout(1.0)
     log(f"tunnel up: {LOCAL_HOST}:{LOCAL_PORT} -> vps:{REMOTE_PORT} (over ssh)")
+    beats = 0
     try:
         while True:
             try:
@@ -94,8 +95,17 @@ def serve(client: paramiko.SSHClient):
             except socket.timeout:
                 if not transport.is_active():
                     raise ConnectionError("transport closed")
+                beats += 1
+                if beats % 300 == 0:
+                    # r7-10：隧道健康时可能长时间零日志（没连接就没输出），
+                    # 「serve 卡死」和「正常等待」在日志上同形。accept 超时是
+                    # 1s 一拍，每 300 拍（5min）留一条心跳，watchdog 的 quiet
+                    # 检查（阈值 1800s）才有判据。
+                    log(f"idle heartbeat: tunnel serving, transport="
+                        f"{'active' if transport.is_active() else 'DEAD'}")
                 continue
             on_conn(conn, transport)
+            beats = 0
     finally:
         srv.close()
 

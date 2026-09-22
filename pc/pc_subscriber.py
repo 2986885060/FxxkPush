@@ -151,8 +151,21 @@ def run():
                    for t in TOPICS]
         for t in threads:
             t.start()
+        beats = 0
         while any(t.is_alive() for t in threads):
             time.sleep(5)
+            beats += 1
+            if beats % 60 == 0:
+                # r7-10：上游零流量时两条流可以「建立后一条消息都没有」，
+                # 和「订阅半开已断但没报错」在日志上同形（read=120s 超时
+                # 只在真断时才触发）。每 5 分钟一条心跳 + 线程存活数。
+                alive = sum(t.is_alive() for t in threads)
+                log(f"idle heartbeat: {alive}/{len(threads)} streams alive, "
+                    f"no message yet")
+        # r7-10：线程全死会掉出上面的 while —— 这是「进程活着但订阅全断」，
+        # 原来直接走到 except 外静默结束 run()，进程还挂着但什么都不订。
+        log("ALL stream threads exited — subscriber 死了，watchdog procs 仍绿但 "
+            "这条链路已断（r7-10），需要重启本服务")
     except KeyboardInterrupt:
         log("bye")
 

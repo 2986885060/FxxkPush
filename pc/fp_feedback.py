@@ -32,7 +32,21 @@ from pathlib import Path
 import pclog
 
 HERE = Path(__file__).parent
-LOG = pclog.get_logger("fp_feedback")
+# r7-7：**惰性**创建 handler。原来模块顶层 get_logger —— ai_triager 顶层
+# `import fp_feedback` 会连带在它进程里挂上 fp_feedback.log 的
+# RotatingFileHandler，于是「常驻 triager」和「手跑 CLI」各持一个句柄写同一
+# 文件；Windows 下 rename 需要另一进程先关句柄，谁先轮转谁 PermissionError，
+# 被 logging.handleError 静默吞掉 -> 2MBx3 上限实际失效、文件无限涨（r7-7）。
+# 惰性后：import 只拿函数不拿句柄，handler 只在本进程真要写这个日志时才建，
+# 且配合 pclog._trim_inplace 兜底（rename 被挡时就地截断），增长仍有上界。
+LOG = None
+
+
+def _get_LOG():
+    global LOG
+    if LOG is None:
+        LOG = pclog.get_logger("fp_feedback")
+    return LOG
 
 TOPIC = "fp-feedback"
 FEEDBACK_FILE = HERE / "feedback.jsonl"
@@ -54,7 +68,7 @@ _rules_mtime: float = -1.0
 
 
 def log(msg: str) -> None:
-    pclog.log_auto(LOG, msg)
+    pclog.log_auto(_get_LOG(), msg)
 
 
 # ---------------------------------------------------------------- 通道地址
@@ -150,8 +164,16 @@ def _load_rules() -> dict:
     global _rules_cache, _rules_mtime
     try:
         mtime = RULES_FILE.stat().st_mtime
-    except OSError:
-        mtime = -1.0
+    except OSError as e:
+        # r7-6：stat 失败（AV 短暂锁文件）≠ 文件损坏。原实现直接 mtime=-1.0，
+        # 与缓存 mtime 不等 -> 走下面 fresh={"sources":{}} **覆盖** _rules_cache
+        # 并把 _rules_mtime 记成 -1 —— 学到的静音规则被静默清空、回到每条都
+        # 问 AI，且锁住期间每轮都用空规则。P2-5 当时只修了 read_text 分支。
+        # 保留旧缓存、**不更新 mtime**，下次调用自然重试。
+        if isinstance(_rules_cache, dict):
+            log(f"rules stat failed ({e!r}), keeping previous cache")
+            return _rules_cache
+        mtime = -1.0      # 首次加载就撞锁：没有缓存可保，走空规则起步
     if _rules_cache is None or mtime != _rules_mtime:
         if mtime < 0:
             fresh: dict = {"sources": {}}

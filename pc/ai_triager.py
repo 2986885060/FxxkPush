@@ -21,6 +21,7 @@ import json
 import re
 import sys
 import time
+import psutil        # _clean_tmp 的 pid 已死判定（r7-9b）
 from pathlib import Path
 
 import httpx
@@ -37,6 +38,13 @@ except Exception:
     # 导入期读取点全仓库有 4 处，这是其中之一）。给一份能跑起来的配置：
     # api_key 空 → classify 收 401，那是 LLM 侧、有 .response，走服务端
     # 退避并留日志 —— 比进程直接消失好得多。
+    CONFIG = {}
+if not isinstance(CONFIG, dict):
+    # r7-9a：文件是合法 JSON 但不是对象（数组/字符串/数字）时，json.loads
+    # 不抛异常，CONFIG 就成了非 dict —— 下面 setdefault 直接 AttributeError，
+    # 而这行跑在 sys.excepthook 挂上**之前**，pythonw 下无声退出。watchdog
+    # 每 300s revive 一次，每次都在同一行死 -> 无人可自动修复的崩溃循环，
+    # 每 5 分钟只留一行 FATAL。降级成空 dict，由 setdefault 补齐必需键。
     CONFIG = {}
 # 补齐必需键：即使配置文件被手改少了字段，也不该在运行中途 KeyError。
 CONFIG.setdefault("model", "mimo-v2.6-flash")
@@ -215,10 +223,24 @@ def _clean_tmp() -> None:
     本模块自己那几种名字，不误伤别的文件。（正常失败路径自己会 unlink，
     这里兜的是「unlink 之前进程就被 kill」的窗口。）
     """
-    for p in HERE.glob(f"{STATE.name}.*.tmp"):
+    # r7-9b：泛化到 pc/ 下全部 *.<pid>.tmp —— 原来只清 triage_state 自己
+    # 那种名字，listener_state / vision_state / triage_rules 每次硬崩溃都
+    # 残留一个，与 P2-3 的初衷不一致。
+    # 判据用 **pid 是否已死**（不是 mtime）：mtime > 600s 那版有两个坑 ——
+    # (1) 崩溃后 600s 内被 watchdog revive 重启时清不掉（revive 冷却才 300s），
+    #     残留跨多轮；(2) 「活着的进程正在写的 tmp」要等 10 分钟才被排除。
+    # pid 活着 = 有人几分钟内就会 replace 它，跳过；pid 死了 = 没人认领，
+    # 立即清。pid 被系统复用给无关进程的极端情况只是晚清一次，无害。
+    for p in HERE.glob("*.tmp"):
+        m = re.search(r"\.(\d+)\.tmp$", p.name)
+        if not m:
+            continue          # 只认带 pid 的原子写临时名，不误伤其它 .tmp
+        pid = int(m.group(1))
+        if pid == os.getpid() or psutil.pid_exists(pid):
+            continue
         try:
             p.unlink()
-            log(f"removed orphan tmp: {p.name}")
+            log(f"removed orphan tmp: {p.name} (pid {pid} 已死)")
         except OSError:
             pass
 
@@ -326,12 +348,25 @@ async def flush_pending(client, st):
     丢弃；超过 PENDING_TTL 才清按钮快照并落盘 —— 那之后手机上不会再出现
     这个 pid 的👍/👎，留着快照只会白占 7 天 state。
     """
+    beats = 0
     while True:
         await asyncio.sleep(RETRY_INTERVAL)
+        beats += 1
+        if beats % 20 == 0:
+            # r7-10：SSE 订阅建立后上游一条消息都没有 / 订阅其实已断但没报错，
+            # 两者在日志上同形。每 5 分钟一条固定心跳，watchdog 的 quiet 检查
+            # 才有判据（read=120s 超时只在真断时触发，不产生任何周期日志）。
+            log(f"idle heartbeat: pending={len(_push_pending)} topics={len(ALL_TOPICS)}")
         if not _push_pending:
             continue
-        item = _push_pending.pop(0)
-        if time.time() - item.get("ts", 0) > PENDING_TTL:
+        # r7-3（P1）：peek 而不是先 pop —— client 重建路径会在下面 await 点
+        # 注入 CancelledError，原实现此时条目已出队、尚未回插，于是这一条
+        # 既没发出也没留在队列里，静默丢失（断网/抖动正是高发场景）。
+        # peek + 成功后才 remove：cancel 落在任何位置，条目都还在队首。
+        item = _push_pending[0]
+        age = time.time() - item.get("ts", 0)
+        if age > PENDING_TTL or age < 0:
+            _push_pending.pop(0)
             if item.get("pid"):
                 st["pushes"].pop(item["pid"], None)
                 save_state(st)
@@ -341,9 +376,15 @@ async def flush_pending(client, st):
         ok = await push_phone(client, item["title"], item["message"],
                               actions=item.get("actions"))
         if ok:
+            # 单消费者，pop 前确认还是同一条（await 期间理论上没人动它，
+            # 但防御性判断零成本）
+            if _push_pending and _push_pending[0] is item:
+                _push_pending.pop(0)
             log(f"PUSH_RETRY ok [{item['title']}] {item['message'][:50]}")
         else:
-            _push_pending.append(item)
+            # 失败转队尾，不阻塞后面别的消息
+            if _push_pending and _push_pending[0] is item:
+                _push_pending.append(_push_pending.pop(0))
 
 
 async def handle_event(client, st, topic, ev):
