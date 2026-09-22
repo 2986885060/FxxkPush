@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """FuckPush AI triager — the brain.
 
-Consumes two ntfy topics (fp-pc: Windows notifications, fp-gray: VPS
-gray-zone events), asks MiMo to classify importance, and:
+Consumes four ntfy topics (fp-pc: Windows notifications, fp-gray: VPS
+gray-zone events, fp-vps: VPS hard alerts, fp-feedback: the 👍/👎 buttons
+on pushes this service sent), asks MiMo to classify importance, and:
   - important  -> publish to fp-phone (phone buzzes)
   - unimportant-> silent archive
 
-Also has dedup: same-kind events within a sliding window are batched and
-only one push goes out with a count. Daily report at configured time.
+Repeats of the same source+content inside a sliding window are suppressed
+entirely (no API call, no push). Daily report at configured time.
 
 Runs alongside pc_subscriber.py / notification_listener.py.
 """
 import asyncio
 import os
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -150,7 +152,6 @@ async def classify(client: httpx.AsyncClient, kind: str, content: str) -> dict:
 def dedup_check(st, kind, content) -> str | None:
     """Collapse repeats of the same source within window. Returns summary
     override or None (first occurrence passes through)."""
-    import re
     src = re.sub(r"\s+", "", content)[:40]
     now = time.time()
     win = CONFIG["dedup_window_sec"]
@@ -239,6 +240,14 @@ async def handle_event(client, st, topic, ev):
 
     try:
         verdict = await classify(client, kind, content)
+        if not isinstance(verdict, dict):
+            # 模型完全可能返回合法 JSON 但不是对象（["重要"] / "重要" /
+            # null —— classify 自己就在处理模型不守 fence，说明这类偏移真实
+            # 存在）。类型检查必须放在 try **里面**：放外面的话这里抛
+            # AttributeError，本该兜底的「AI 异常默认推送」反而失效，
+            # 消息被 consume 吞掉（第 2 轮 P2）。
+            raise TypeError(f"model returned {type(verdict).__name__}: "
+                            f"{str(verdict)[:60]}")
     except Exception as e:
         log(f"classify failed ({e!r}) -> fallback: push (safer to buzz)")
         verdict = {"label": "重要", "reason": "AI异常默认推送"}
@@ -250,17 +259,16 @@ async def handle_event(client, st, topic, ev):
     archive(rec)
 
     if label == "重要":
-        # include repeat count if this source has history
-        import re
-        key = next((k for k in st["recent"]
-                    if k.startswith(f"{kind}:") and
-                    re.sub(r"\s+", "", content)[:40] in k), None)
-        cnt = st["recent"].get(key, {}).get("count", 1) if key else 1
-        suffix = f"（第{cnt}次）" if cnt > 1 else ""
         # 推送快照：反馈回来时靠它还原 src/content。triage_log 是轮转的，
         # 几天后点一次按钮去那里查只会读到空 —— 所以自包含地存一份。
         # 只有 fp-pc 才带按钮：其它 topic 的 src 就是 topic 名本身，规则粒度
         # 是「整条通道」，3 次👎 会把 VPS 告警整条静音（不可接受）。
+        #
+        # 这里原本还有「（第N次）」后缀：dedup_check 对窗口内的重复直接
+        # return None（静默抑制，不推也不调 AI），所以能走到推送的必然是首次，
+        # count 恒为 1、后缀恒为空 —— 死代码。而且它用子串匹配找 key，
+        # content 去空白后为空串时 `"" in k` 恒真，会把别人的计数算到自己头上。
+        # 一并删掉（第 2 轮 P2 + 性能项）。
         pid = pclog.new_trace_id()
         actions = fp_feedback.build_actions(pid) if topic == "fp-pc" else None
         if actions:
@@ -272,8 +280,8 @@ async def handle_event(client, st, topic, ev):
                 "content": content[:500], "label": label, "reason": reason,
             }
             _prune_pushes(st)
-        ok = await push_phone(client, f"{src}{suffix}",
-                              f"{content[:200]}\n— {reason}", actions=actions)
+        ok = await push_phone(client, src, f"{content[:200]}\n— {reason}",
+                              actions=actions)
         if not ok and actions:
             # 没推出去 = 手机上不会出现按钮 = 这个 pid 永远等不到反馈，
             # 留着只是白占 7 天 state
@@ -299,9 +307,22 @@ def _unwrap(ev: dict, body: str) -> dict:
     except json.JSONDecodeError:
         maybe = None
     if isinstance(maybe, dict):
-        parsed = maybe.get("data", maybe)
-        if not isinstance(parsed, str):
-            return {"title": ev.get("title", ""), **parsed}
+        data = maybe.get("data")
+        if isinstance(data, dict):
+            # 顶层键和 data 里的键**都要**：handle_event 拿 kind 当事件类型
+            # 标签（dedup 也用它分组），原来只 `{"title", **data}` 会把顶层的
+            # kind/ts 一起丢掉 —— fp-gray 的形状正是 {"ts","kind","data"}。
+            # message 兜底必须铺在最前，否则 fp-gray 的 data 里没有 message 键
+            # 时 handle_event 会拿到空 body，AI 分诊只剩个标签、内容全丢
+            # （第 2 轮 P2，既有缺陷，借这次抽出一并修）。
+            # 顶层若带 message/title 则照旧覆盖，与 fp-pc 原行为一致。
+            return {"title": ev.get("title", ""), "message": body,
+                    **maybe, **data}
+        # data 不是对象（str/None/int/list）→ 顶层原样返回
+        return {"title": ev.get("title", ""), "message": body, **maybe}
+    # 走到这里：不是 JSON，或 JSON 不是对象（["重要"] / null / 数字）。
+    # 原实现在 isinstance(parsed, str) 为假时直接 **parsed —— **None 会
+    # TypeError，违背自己「绝不抛」的 docstring，消息被 consume 吞掉。
     return {"title": ev.get("title", ""), "message": body}
 
 
@@ -363,6 +384,7 @@ async def supervise(client, st, topic, max_fails: int = 12):
     必须换掉整个客户端 —— 原 main 的重连逻辑正是为此存在，不能丢。
     """
     fails = 0
+    config_retries = 0
     while True:
         try:
             await consume(client, st, topic)
@@ -371,7 +393,23 @@ async def supervise(client, st, topic, max_fails: int = 12):
             fails += 1
             log(f"[{topic}] stream error: {e!r} #{fails}, reconnect in 5s")
             if fails >= max_fails:
-                raise
+                fails = 0
+                status = getattr(getattr(e, "response", None),
+                                 "status_code", None)
+                if status in (401, 403, 404, 410):
+                    # 配置级故障：换 client 一点用没有，可要是照旧 raise，
+                    # 4 条流会被这个自己用不到的 topic 每 ~65 秒整体拖断一次，
+                    # 而重连不回放 —— 断开那几秒的消息永久丢失（第 2 轮 P2）。
+                    # 改成让**这条流**自己指数退避，其余三条照常跑；不设上限，
+                    # 配置改好后的下一轮重试自然恢复，不做「永久放弃」——
+                    # 隧道断 80 分钟那种长故障不该把 topic 判死。
+                    config_retries += 1
+                    delay = min(600, 30 * 2 ** min(config_retries, 5))
+                    log(f"[{topic}] HTTP {status} 配置级故障：单流退避 {delay}s"
+                        f"（其余流不受影响，第 {config_retries} 次）")
+                    await asyncio.sleep(delay)
+                    continue
+                raise   # 传输级故障才升级：那才是换 client 能治的
         await asyncio.sleep(5)   # 正常收尾也要等：否则服务端秒断会变成紧循环
 
 
