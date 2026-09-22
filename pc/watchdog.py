@@ -11,14 +11,21 @@
 所以先试本地（快），失败就用 SSH 到 VPS 上发 —— SSH 端口是这个网络唯一
 放行的口，隧道死了它还活着。
 
-2026-09-22 教训：隧道 11:33 断到 12:52，80 分钟零告警，因为告警通道和
+2026-09-22 教训一：隧道 11:33 断到 12:52，80 分钟零告警，因为告警通道和
 被监控对象是同一条路。今天这个故障本该在 11:42 就推到手机上。
+
+教训二（同日 17:21-17:28 实测）：**上面那两条通道共享「外部网络」这一个
+故障域** —— 隧道 WinError 10061 和 SSH TimeoutError 是同时发生的，
+watchdog 连打两条「告警两条通道都失败！」。所以还有第三条：
+``push_toast`` 走 Windows 原生通知中心，零网络依赖，断网也弹得出来。
 """
 from __future__ import annotations
 
 import base64
 import json
+import os
 import re
+import subprocess
 import psutil
 import time
 from datetime import datetime
@@ -261,16 +268,71 @@ def push_vps(payload: dict) -> bool:
             pass
 
 
+def push_toast(title: str, message: str) -> bool:
+    """Windows 原生 toast —— 零网络依赖，两条网络通道同时挂时的最后防线。
+
+    2026-09-22 17:21-17:28 实测过这个缺口：ntfy 隧道 WinError 10061 和
+    VPS SSH TimeoutError **同时**发生（前两条通道共享「外部网络」这一个
+    故障域），watchdog 连打两条「告警两条通道都失败！」—— 最该报警的
+    时刻一条都没送出去，等恢复了才把「已恢复」发出来。这条通道只碰本机
+    通知中心：断网、隧道死、SSH 死都照样弹。
+
+    AUMID 用 ``"Windows PowerShell"``（powershell.exe 在通知中心的注册名，
+    Win10/11 内置，零第三方依赖）—— 实测 CreateToastNotifier 对它不抛，
+    stdout 收到 SHOWN、returncode 0。中文经环境变量传，绕开命令行转义。
+    """
+    ps = (
+        "$ErrorActionPreference='Stop'; "
+        "[void][Windows.UI.Notifications.ToastNotificationManager,"
+        "Windows.UI.Notifications,ContentType=WindowsRuntime]; "
+        "$x=[Windows.UI.Notifications.ToastNotificationManager]::"
+        "GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]"
+        "::ToastText02); "
+        "$t=$x.GetElementsByTagName('text'); "
+        "$t.Item(0).AppendChild($x.CreateTextNode($env:FP_T))|Out-Null; "
+        "$t.Item(1).AppendChild($x.CreateTextNode($env:FP_M))|Out-Null; "
+        "$n=[Windows.UI.Notifications.ToastNotificationManager]::"
+        "CreateToastNotifier('Windows PowerShell'); "
+        "$n.Show([Windows.UI.Notifications.ToastNotification]::new($x)); "
+        "Write-Output 'SHOWN'"
+    )
+    env = {**os.environ, "FP_T": title[:120], "FP_M": message[:900]}
+    try:
+        # 同步等退出码：Popen 不等待的话，「弹失败了」和「弹成功」在日志里
+        # 长得一模一样，等于这条通道没有可观测性。
+        p = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-WindowStyle", "Hidden", "-Command", ps],
+            capture_output=True, text=True, timeout=20, env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = (p.stdout or "").strip()
+        if p.returncode == 0 and "SHOWN" in out:
+            return True
+        LOG.error(f"toast channel failed: rc={p.returncode} "
+                  f"stderr={(p.stderr or '').strip()[:300]!r}")
+        return False
+    except Exception as e:
+        LOG.error(f"toast channel failed: {e!r}")
+        return False
+
+
 def send_alert(title: str, message: str) -> bool:
-    """先本地（隧道健康时秒回），失败走 SSH。任一成功即算送达。"""
+    """降级链：本地隧道（秒回）→ VPS SSH → 本机 toast（零网络）。
+
+    前两条共享「外部网络」故障域（17:21 实测同时挂），toast 只碰本机 ——
+    三条里至少有一条在任何网络状态下都可用。
+    """
     payload = _ntfy_payload(title, message)
     if push_local(payload):
-        LOG.info(f"告警已送达(本地) {title}")
+        LOG.info(f"告警已送达(本地隧道) {title}")
         return True
     if push_vps(payload):
         LOG.info(f"告警已送达(VPS-SSH兜底) {title}")
         return True
-    LOG.error(f"告警两条通道都失败！{title}")
+    if push_toast(title, message):
+        LOG.info(f"告警已送达(本机toast，两条网络通道都失败) {title}")
+        return True
+    LOG.error(f"告警三条通道都失败！{title}")
     return False
 
 
