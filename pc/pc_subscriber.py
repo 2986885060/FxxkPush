@@ -46,10 +46,11 @@ ECHO = Path(__file__).parent / "toast_echo.jsonl"
 def record_echo(title, message):
     """Remember what we popped so notification_listener ignores the echo."""
     try:
-        with ECHO.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": time.time(), "title": (title or "").strip(),
-                                "msg": (message or "").strip()},
-                               ensure_ascii=False) + "\n")
+        pclog.append_rotating(
+            ECHO, json.dumps({"ts": time.time(), "title": (title or "").strip(),
+                              "msg": (message or "").strip()},
+                             ensure_ascii=False),
+            max_bytes=256 * 1024, mode="tail")
     except Exception as e:
         # 写失败 = 回环指纹缺失 -> notification_listener 认不出自己弹的 toast，
         # 窗口期内会把它当新通知重推给手机。静默吞掉等于把回环藏起来。

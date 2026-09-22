@@ -64,8 +64,8 @@ sys.excepthook = _log_crash
 
 def archive(rec):
     try:
-        with ARCHIVE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        pclog.append_rotating(ARCHIVE, json.dumps(rec, ensure_ascii=False),
+                              mode="rotate")
     except Exception as e:
         # 磁盘满/权限问题不该让一条消息掀翻消费循环
         log(f"archive write failed: {e!r}")
@@ -73,12 +73,22 @@ def archive(rec):
 
 def load_state():
     if STATE.exists():
-        return json.loads(STATE.read_text())
+        try:
+            return json.loads(STATE.read_text())
+        except Exception as e:
+            # 状态损坏（断电/非原子写时代留下的半截 JSON）。load_state 在
+            # main() 的 while True 之外，这里抛出去就是服务死、没人接得住。
+            # 丢去重状态的最坏后果只是同一条消息重新分诊一次，比死强。
+            log(f"triage state corrupt ({e!r}), resetting")
     return {"recent": {}, "last_report": ""}
 
 
 def save_state(st):
-    STATE.write_text(json.dumps(st, ensure_ascii=False))
+    # 原子写：先落 .tmp 再 rename。直接 write_text 写一半断电会留下半截
+    # JSON —— 这个函数在每条消息的 finally 里跑，非原子写等于埋雷。
+    tmp = STATE.with_name(STATE.name + ".tmp")
+    tmp.write_text(json.dumps(st, ensure_ascii=False))
+    tmp.replace(STATE)
 
 
 async def classify(client: httpx.AsyncClient, kind: str, content: str) -> dict:
