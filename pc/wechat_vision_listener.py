@@ -229,16 +229,29 @@ def bgra_to_png(bgra: bytes, w: int, h: int) -> bytes:
     try:
         from PIL import Image
         import io as _io
-        # raw decoder "BGRA": 4 字节 -> RGB 一步解码，全程 C，无步长切片
-        # （切片版 1200x800 要 694ms，这版直接省掉那次逐元素搬运）。
-        img = Image.frombytes("RGB", (w, h), bgra, "raw", "BGRA", 0, 1)
+        # raw decoder：**必须是 "BGRX"**，不是 "BGRA"。
+        # Image.frombytes("RGB", ..., "raw", "BGRA", 0, 1) 在 Pillow 12.3.0
+        # 上直接抛 ValueError: unknown raw mode for given image mode —— 这行
+        # 之所以一直没炸，只是因为它被下面那个同名 def 覆盖、从没执行过
+        # （第 4 轮把两层衔接起来时第一次真正跑它才发现）。X = 忽略 alpha，
+        # 正是我们要的：4 字节/像素、一步解码出 RGB、全程 C。
+        # BGRX 实测解码 (30,20,10) = R,G,B，通道顺序没反。
+        img = Image.frombytes("RGB", (w, h), bgra, "raw", "BGRX")
         out = _io.BytesIO()
         img.save(out, "PNG", compress_level=6)
         return out.getvalue()
     except ImportError:
         pass  # Pillow 缺失：走下面的纯 Python 实现
+    # 注意：原来这里**没有 return**，而且下面那个同名 def 把整个函数覆盖了 ——
+    # 结果是 Pillow 那条 C 快路径从来没执行过（docstring 里的 2.4x 优化一次
+    # 都没生效），每张截图都在走纯 Python 逐像素循环；而「except ImportError:
+    # pass」落到函数尾部会 return None，让 analyze() 里 b64encode(None) 炸掉。
+    # 第 4 轮把纯实现改名成 fallback，两层真正衔接起来。
+    return _bgra_to_png_pure(bgra, w, h)
 
-def bgra_to_png(bgra: bytes, w: int, h: int) -> bytes:
+
+def _bgra_to_png_pure(bgra: bytes, w: int, h: int) -> bytes:
+    """纯 Python fallback（Pillow 缺失时）。输出与 Pillow 路径逐像素一致。"""
     import struct
     import zlib
     rows = []

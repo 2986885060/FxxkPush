@@ -33,7 +33,14 @@ CONFIG = json.loads((HERE / "triage_config.json").read_text(encoding="utf-8"))
 
 NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
 _SECRET = HERE / "ntfy.secret"
-NTFY_TOKEN = (_SECRET.read_text().strip() if _SECRET.exists() else "")
+try:
+    NTFY_TOKEN = _SECRET.read_text().strip() if _SECRET.exists() else ""
+except Exception:
+    # 导入期崩在下面 sys.excepthook 挂上**之前** → pythonw 下连 FATAL
+    # 日志都没有，服务直接无声消失。exists() 和 read_text() 之间 AV 独占
+    # 一下就够。读不到就空着：classify 会因 401 走 supervise 的服务端退避，
+    # 日志里看得见 —— 和 fp_feedback._token() 同一套自愈契约（第 4 轮）。
+    NTFY_TOKEN = ""
 ARCHIVE = HERE / "triage_log.jsonl"
 STATE = HERE / "triage_state.json"
 
@@ -137,9 +144,23 @@ def load_state():
 def save_state(st):
     # 原子写：先落 .tmp 再 rename。直接 write_text 写一半断电会留下半截
     # JSON —— 这个函数在每条消息的 finally 里跑，非原子写等于埋雷。
-    tmp = STATE.with_name(STATE.name + ".tmp")
-    tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(STATE)
+    # 临时名带 pid：重启重叠期两个进程共用固定 .tmp 会把半截 JSON replace
+    # 上去（load_state 会自愈重置，代价是去重状态清零）。
+    tmp = STATE.with_name(f"{STATE.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(STATE)
+    except OSError as e:
+        # 这里在 consume 的 finally 里 —— 异常冒出去会被 supervise 当成
+        # stream error：断流重连，而**重连不回放**，断开窗口内的消息永久
+        # 丢失。Windows 上编辑器/AV/索引器在 rename 瞬间持句柄就能触发。
+        # 落不下盘就打日志继续，下一条消息的 save_state 会带上同样状态；
+        # 权衡下来「丢一次落盘」远好过「为了它断一条流」（第 4 轮）。
+        log(f"save_state failed ({e!r}) —— 本条状态未落盘，下条会重试")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 async def classify(client: httpx.AsyncClient, kind: str, content: str) -> dict:
@@ -165,8 +186,11 @@ async def classify(client: httpx.AsyncClient, kind: str, content: str) -> dict:
 
 
 def dedup_check(st, kind, content) -> str | None:
-    """Collapse repeats of the same source within window. Returns summary
-    override or None (first occurrence passes through)."""
+    """同一源在窗口期内的重复条目整条压掉（不问 AI、不推送）。
+
+    返回 ``"pass"`` 表示首次出现、放行；``None`` 表示命中窗口、压掉。
+    调用方只判 ``is None``。
+    """
     src = re.sub(r"\s+", "", content)[:40]
     now = time.time()
     win = CONFIG["dedup_window_sec"]
@@ -184,11 +208,10 @@ def dedup_check(st, kind, content) -> str | None:
             del st["recent"][k]
     key = f"{kind}:{src}"
     if key in st["recent"]:
-        c = st["recent"][key].get("count")
-        st["recent"][key]["count"] = (
-            (c if isinstance(c, int) and not isinstance(c, bool) else 1) + 1)
-        return None  # suppressed, count recorded
-    st["recent"][key] = {"ts": now, "count": 1}
+        return None  # suppressed
+    # 不再写 count：第 2 轮删掉了它唯一的消费者「（第N次）」，第 4 轮确认
+    # 全仓库再无读取端 —— 连同为它加的类型防御一起是死代码。
+    st["recent"][key] = {"ts": now}
     return "pass"
 
 
@@ -292,9 +315,7 @@ async def handle_event(client, st, topic, ev):
     label = str(raw_label).strip().rstrip("。.！! ，,").strip() \
         if raw_label is not None else ""
     reason = str(verdict.get("reason", "") or "")
-    if label == "忽略":
-        pass
-    elif label != "重要":
+    if label not in ("重要", "忽略"):
         reason = (f"未知判定 {raw_label!r}，按重要推送（fail-open）"
                   + (f"；模型给的理由：{reason}" if reason else ""))
         label = "重要"
@@ -432,42 +453,58 @@ async def supervise(client, st, topic, max_fails: int = 12):
     httpx client：client 级的故障（系统代理毒化那种）在流内小打小闹治不好，
     必须换掉整个客户端 —— 原 main 的重连逻辑正是为此存在，不能丢。
     """
-    fails = 0
-    config_retries = 0      # 只在**成功消费一条**后复位：否则历史上只要发生过
-                            # 一次 4xx 退避，之后任何故障都会从封顶值起步
+    fails = 0            # 只统计**传输级**故障（攒够才换 client）
+    config_retries = 0   # 服务端响应类故障的退避序号，见下方复位条件
     while True:
+        t0 = time.time()
         try:
             await consume(client, st, topic)
             fails = 0            # 服务端主动断开也算一次干净收尾
             config_retries = 0   # 故障确实好了 —— 退避序列要从短的重新来
         except Exception as e:
             fails += 1
+            resp = getattr(e, "response", None)
+            status = getattr(resp, "status_code", None)
+            if status is not None:
+                # 只要拿到了 HTTP 响应（4xx / 429 / 5xx 一视同仁），换
+                # client 就是白费：那是服务端或代理的事。
+                # 原来这个分支被嵌在 ``if fails >= max_fails`` 里面 —— 收到
+                # 服务端响应后还要先白撞 12 次 × 5s（整整 60 秒）才轮到退避，
+                # 而且上面那句「reconnect in 5s」会先于「退避 600s」打出来，
+                # 日志自相矛盾。现在一收到响应就退避，fails 只留给真正的
+                # 传输级故障（第 4 轮）。
+                # 棘轮消除：流撑过了 300s 才失败 → 上一轮配置故障早已恢复，
+                # 这是新一轮 episode；否则历史上发生过一次 4xx 之后，**任何**
+                # 后续瞬时故障都从封顶 600s 起步 —— 光靠「consume 干净 return
+                # 才复位」不够，配置故障恢复后流会开上几天、根本不 return。
+                if time.time() - t0 > 300:
+                    config_retries = 0
+                config_retries += 1
+                # 从 30s 起（上一版 30*2**n 首次算出 60s，off-by-one），
+                # 30/60/120/240/480/600 封顶
+                delay = min(600, 30 * 2 ** max(0, config_retries - 1))
+                log(f"[{topic}] server {status}, single-stream backoff "
+                    f"{delay}s (第 {config_retries} 次，其余流不受影响)")
+                await asyncio.sleep(delay)
+                continue
+            # 没 response = 连都没连上（隧道断/端口不通）→ 这类才该换 client
             log(f"[{topic}] stream error: {e!r} #{fails}, reconnect in 5s")
             if fails >= max_fails:
                 fails = 0
-                # 只要**拿到了 HTTP 响应**（4xx / 429 / 5xx 一视同仁），换
-                # client 就是白费：那是服务端或代理的事。第 2 轮只白名单
-                # 401/403/404/410，429 和 500 仍走 raise —— 持续超过 65 秒
-                # 时照样每 65 秒把 4 条流整体拖断，正是那个修复要消灭的模式。
-                # 判据改成「有没有 response」更准，也不用维护状态码清单。
-                if getattr(e, "response", None) is not None:
-                    config_retries += 1
-                    # 从 30s 起（上一版 30*2**n 首次算出 60s，off-by-one），
-                    # 30/60/120/240/480/600
-                    delay = min(600, 30 * 2 ** max(0, config_retries - 1))
-                    log(f"[{topic}] HTTP {getattr(e.response, 'status_code', '?')} "
-                        f"服务端/代理故障：单流退避 {delay}s"
-                        f"（其余流不受影响，第 {config_retries} 次）")
-                    await asyncio.sleep(delay)
-                    continue
-                raise   # 连都没连上 —— 隧道/客户端问题，那才该换 client
+                raise   # 换掉整个客户端
         await asyncio.sleep(5)   # 正常收尾也要等：否则服务端秒断会变成紧循环
 
 
 async def main():
     log(f"triager up: model={CONFIG['model']}, out={TOPIC_OUT}")
     st = load_state()
-    timeout = httpx.Timeout(connect=15, read=None, write=15, pool=15)
+    # read 不能是 None：那样 SSE 流**没有任何读超时**，网络路径静默失效
+    # （休眠唤醒 / NAT 超时 / 网络切换，没发 FIN 也没 RST）时 aiter_lines()
+    # 会永久阻塞 —— 无日志、不重连、watchdog 也查不出（进程活着、/v1/health
+    # 正常），消息全丢到重启为止（第 4 轮 P1）。ntfy 每 30s 发一个
+    # {"event":"keepalive"}，consume 对非 message 事件本来就 continue，
+    # 所以 120s 是「远大于 keepalive 间隔、又不至于让半开连接挂一辈子」。
+    timeout = httpx.Timeout(connect=15, read=120, write=15, pool=15)
     while True:
         # Rebuild the client on every reconnect attempt with trust_env=False.
         # With trust_env on, httpx snapshots the Windows system proxy at
