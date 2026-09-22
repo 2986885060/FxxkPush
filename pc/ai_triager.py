@@ -29,18 +29,26 @@ import pclog
 import fp_feedback
 
 HERE = Path(__file__).parent
-CONFIG = json.loads((HERE / "triage_config.json").read_text(encoding="utf-8"))
+try:
+    CONFIG = json.loads((HERE / "triage_config.json").read_text(encoding="utf-8"))
+except Exception:
+    # 损坏的 JSON、或 read_text 被 AV 瞬间独占 —— 这行跑在下面
+    # sys.excepthook 挂上**之前**，pythonw 下会无声退出（第 5 轮：这类
+    # 导入期读取点全仓库有 4 处，这是其中之一）。给一份能跑起来的配置：
+    # api_key 空 → classify 收 401，那是 LLM 侧、有 .response，走服务端
+    # 退避并留日志 —— 比进程直接消失好得多。
+    CONFIG = {}
+# 补齐必需键：即使配置文件被手改少了字段，也不该在运行中途 KeyError。
+CONFIG.setdefault("model", "mimo-v2.6-flash")
+CONFIG.setdefault("dedup_window_sec", 1800)
+CONFIG.setdefault("api_key", "")
+CONFIG.setdefault("base_url", "https://api.xiaomimimo.com/v1")
+CONFIG.setdefault("max_tokens", 200)
 
 NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
 _SECRET = HERE / "ntfy.secret"
-try:
-    NTFY_TOKEN = _SECRET.read_text().strip() if _SECRET.exists() else ""
-except Exception:
-    # 导入期崩在下面 sys.excepthook 挂上**之前** → pythonw 下连 FATAL
-    # 日志都没有，服务直接无声消失。exists() 和 read_text() 之间 AV 独占
-    # 一下就够。读不到就空着：classify 会因 401 走 supervise 的服务端退避，
-    # 日志里看得见 —— 和 fp_feedback._token() 同一套自愈契约（第 4 轮）。
-    NTFY_TOKEN = ""
+# token 走惰性读取，见下面的 ntfy_token() —— 导入期读一次会把一次 AV 抖动
+# 永久定成空串，而空 token 发出去的 `Bearer ` 是非法头值（第 5 轮 P2·必修）。
 ARCHIVE = HERE / "triage_log.jsonl"
 STATE = HERE / "triage_state.json"
 
@@ -72,6 +80,45 @@ def log(msg):
     # file log: pythonw runs have no console, a crash must leave evidence.
     # pclog owns rotation/format/level — do not hand-roll it here.
     pclog.log_auto(LOG, msg)
+
+
+_token_cache: str | None = None
+
+
+def ntfy_token() -> str:
+    """惰性读取 ntfy token —— **失败与空内容都不缓存**，下次调用自动重试。
+
+    第 4 轮改成导入期读一次 + 包 try，看着更稳，实际更糟（第 5 轮 P2·必修）：
+    读失败把 token 永久定成 ``""``，于是**每个**请求都发
+    ``Authorization: Bearer ***（空）—— httpx 实测抛
+    ``LocalProtocolError('Illegal header value b"Bearer "')``。那是
+    TransportError、**没有 .response**，所以走的是传输级分支，而不是第 4 轮
+    注释里声称的「401 服务端退避」：4 条流每 5s 各打一条 ERROR（≈7 万行/天），
+    第 12 次 raise 换 client，4 条流全断重连不回放，循环到人工重启。
+    文件恢复后本函数下一次调用就读到真 token，自愈 ——这才是和
+    fp_feedback._token() 一致的契约（那边每次推送都重读）。
+    """
+    global _token_cache
+    if _token_cache is None or _token_cache == "":
+        try:
+            tok = _SECRET.read_text().strip() if _SECRET.exists() else ""
+        except Exception as e:
+            log(f"ntfy.secret unreadable ({e!r}) —— 本轮请求不带鉴权头")
+            return ""
+        _token_cache = tok
+    return _token_cache
+
+
+def _auth() -> dict:
+    """鉴权头。**空 token 时不带头**，这是能自愈的关键。
+
+    带空 ``Bearer `` 是非法头值 → LocalProtocolError（TransportError，
+    无 .response → 传输级分支 → 热循环，见 ntfy_token docstring）。
+    不带头则服务端正常回 401 → HTTPStatusError 有 .response →
+    落进 supervise 的服务端退避分支：日志看得见、退避可自愈。
+    """
+    tok = ntfy_token()
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
 
 
 def _log_crash(exc_type, exc, tb):
@@ -133,11 +180,12 @@ def load_state():
         # 校验类型，dedup_check 的 .items() 会让除硬规则外的每条消息都抛，
         # 被 consume 吞掉 —— 服务看着活着，AI 路径其实全废。
         st["recent"] = {}
-    if not isinstance(st.get("pushes"), dict):
-        st["pushes"] = {}
     if not isinstance(st.get("last_report"), str):
         st["last_report"] = ""
-    _prune_pushes(st)   # 内层 entry 的类型也在里面一并洗（见该函数注释）
+    # pushes 的外层/内层类型都在 _prune_pushes 里洗（它开头就处理了
+    # 非 dict 的情况），这里不必再判一次 —— 同一个判断写两遍是第 5 轮
+    # 报的冗余。
+    _prune_pushes(st)
     return st
 
 
@@ -227,7 +275,7 @@ async def push_phone(client, title, message, priority=4, actions=None):
         if actions:
             payload["actions"] = actions
         r = await client.post(NTFY_BASE + "/", timeout=10, json=payload,
-                              headers={"Authorization": f"Bearer {NTFY_TOKEN}"})
+                              headers=_auth())
         return r.status_code == 200
     except Exception as e:
         # 传输失败要在这里变成 False：冒出去会把整条 SSE 断掉（见 consume），
@@ -372,6 +420,7 @@ def _unwrap(ev: dict, body: str) -> dict:
         maybe = json.loads(body) if isinstance(body, str) else None
     except (json.JSONDecodeError, TypeError):
         maybe = None
+    base = {"title": ev.get("title", ""), "message": body}
     if isinstance(maybe, dict):
         data = maybe.get("data")
         if isinstance(data, dict):
@@ -382,30 +431,32 @@ def _unwrap(ev: dict, body: str) -> dict:
             # 真正有用的是那句 message 兜底：data 里没有 message 键时
             # handle_event 会拿到空 body，AI 分诊只剩一个标签、内容全丢。
             # 顶层若带 message/title 则照旧覆盖，与 fp-pc 原行为一致。
-            return {"title": ev.get("title", ""), "message": body,
-                    **maybe, **data}
+            return {**base, **maybe, **data}
         # data 不是对象（str/None/int/list）→ 顶层原样返回
-        return {"title": ev.get("title", ""), "message": body, **maybe}
+        return {**base, **maybe}
     # 走到这里：不是 JSON，或 JSON 不是对象（["重要"] / null / 数字）。
     # 原实现在 isinstance(parsed, str) 为假时直接 **parsed —— **None 会
     # TypeError，违背自己「绝不抛」的 docstring，消息被 consume 吞掉。
-    return {"title": ev.get("title", ""), "message": body}
+    return base
 
 
 async def consume(client, st, topic):
     """JSON stream one topic, handle each message event."""
     url = f"{NTFY_BASE}/{topic}/json"
-    async with client.stream("GET", url, headers={
-            "Authorization": f"Bearer {NTFY_TOKEN}"}) as resp:
+    async with client.stream("GET", url, headers=_auth()) as resp:
         resp.raise_for_status()
         async for line in resp.aiter_lines():
             if not line:
                 continue
             try:
                 ev = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
                 continue
-            if ev.get("event") != "message":
+            # isinstance 挡在 per-message try **外面**的这一句上：json.loads
+            # 合法但不是对象（[1] / null / 123）时 ev.get 直接 AttributeError
+            # → 断流（重连不回放）。同类点 pclog.extract_trace 早就补了
+            # isinstance，这里一直没补（第 5 轮）。
+            if not isinstance(ev, dict) or ev.get("event") != "message":
                 continue
             # trace_id starts here for this message: ntfy only forwards tags,
             # so the id rides in tags (or falls back to the ntfy message id,
@@ -454,40 +505,50 @@ async def supervise(client, st, topic, max_fails: int = 12):
     必须换掉整个客户端 —— 原 main 的重连逻辑正是为此存在，不能丢。
     """
     fails = 0            # 只统计**传输级**故障（攒够才换 client）
-    config_retries = 0   # 服务端响应类故障的退避序号，见下方复位条件
+    config_retries = 0   # 服务端响应类故障的退避序号
+    last_server_err = 0.0  # 上次服务端响应类故障的时刻，棘轮复位用
     while True:
-        t0 = time.time()
         try:
             await consume(client, st, topic)
             fails = 0            # 服务端主动断开也算一次干净收尾
-            config_retries = 0   # 故障确实好了 —— 退避序列要从短的重新来
+            config_retries = 0
         except Exception as e:
-            fails += 1
             resp = getattr(e, "response", None)
             status = getattr(resp, "status_code", None)
             if status is not None:
                 # 只要拿到了 HTTP 响应（4xx / 429 / 5xx 一视同仁），换
-                # client 就是白费：那是服务端或代理的事。
-                # 原来这个分支被嵌在 ``if fails >= max_fails`` 里面 —— 收到
-                # 服务端响应后还要先白撞 12 次 × 5s（整整 60 秒）才轮到退避，
-                # 而且上面那句「reconnect in 5s」会先于「退避 600s」打出来，
-                # 日志自相矛盾。现在一收到响应就退避，fails 只留给真正的
-                # 传输级故障（第 4 轮）。
-                # 棘轮消除：流撑过了 300s 才失败 → 上一轮配置故障早已恢复，
-                # 这是新一轮 episode；否则历史上发生过一次 4xx 之后，**任何**
-                # 后续瞬时故障都从封顶 600s 起步 —— 光靠「consume 干净 return
-                # 才复位」不够，配置故障恢复后流会开上几天、根本不 return。
-                if time.time() - t0 > 300:
+                # client 就是白费：那是服务端或代理的事 → 单流退避。
+                # 棘轮复位：距**上一次**服务端故障超过 10 分钟 = 新一轮
+                # episode，退避从短的重新来。上一版的判据
+                # ``time.time()-t0 > 300`` 是死条件（第 5 轮实测）：
+                # status 只可能来自 consume 里的 raise_for_status()，必然
+                # 发生在 t0 之后 ≤15s+15s 内，永远 <300s —— 承诺的复位
+                # 一次都没发生过，下一次全新 4xx 会直接从残留值起步。
+                now = time.time()
+                if now - last_server_err > 600:
                     config_retries = 0
+                last_server_err = now
                 config_retries += 1
-                # 从 30s 起（上一版 30*2**n 首次算出 60s，off-by-one），
+                # 从 30s 起（30*2**n 首次算出 60s 是 off-by-one），
                 # 30/60/120/240/480/600 封顶
                 delay = min(600, 30 * 2 ** max(0, config_retries - 1))
-                log(f"[{topic}] server {status}, single-stream backoff "
-                    f"{delay}s (第 {config_retries} 次，其余流不受影响)")
+                # 必须带「stream error」：pclog._ERR_PAT 认 \\berror\\b →
+                # 自动定级 ERROR；watchdog 的 _ERR_PAT 同样认它。上一版打的
+                # 是无标记 INFO → 持续 4xx 期间 health 200、procs 齐、link
+                # 也只见 INFO → errs≥3 && oks==0 永不成立 → **手机零告警**，
+                # 而订阅此时可能已经断了、没有 PUSH_FAIL 兜底，全链路静默。
+                log(f"[{topic}] stream error: server {status}, "
+                    f"single-stream backoff {delay}s "
+                    f"(第 {config_retries} 次，其余流不受影响)")
                 await asyncio.sleep(delay)
                 continue
-            # 没 response = 连都没连上（隧道断/端口不通）→ 这类才该换 client
+            # 没 response = 连都没连上（隧道断/端口不通）→ 这类才该换 client。
+            # fails 只在这里累加，与上面「只统计传输级故障」一致 —— 上一版
+            # 在 except 顶部无条件 +1，4xx episode 之后 fails 已 ≥12 且只有
+            # 干净 return 才清零，于是之后**每一次**传输抖动都立即 raise 换
+            # client（4 条流全断 ~5s、不回放），12 次容错形同虚设；而今天
+            # 日志里传输类抖动有 646 条，是常态事件（第 5 轮）。
+            fails += 1
             log(f"[{topic}] stream error: {e!r} #{fails}, reconnect in 5s")
             if fails >= max_fails:
                 fails = 0
@@ -501,9 +562,12 @@ async def main():
     # read 不能是 None：那样 SSE 流**没有任何读超时**，网络路径静默失效
     # （休眠唤醒 / NAT 超时 / 网络切换，没发 FIN 也没 RST）时 aiter_lines()
     # 会永久阻塞 —— 无日志、不重连、watchdog 也查不出（进程活着、/v1/health
-    # 正常），消息全丢到重启为止（第 4 轮 P1）。ntfy 每 30s 发一个
-    # {"event":"keepalive"}，consume 对非 message 事件本来就 continue，
-    # 所以 120s 是「远大于 keepalive 间隔、又不至于让半开连接挂一辈子」。
+    # 正常），消息全丢到重启为止（第 4 轮 P1）。ntfy 实测 keepalive 间隔是
+    # **45s**（连续观测 45.8/90.8/135.8/180.8s，与 ntfy 默认
+    # keepalive-interval: 45s 吻合 —— 第 4 轮注释写的「每 30s」是错的，
+    # 照 30s 去调 read 反而会每 45s 断一次流），consume 对非 message 事件
+    # 本来就 continue，所以 120s = 45s 的 2.7 倍：足够宽，又不至于让半开
+    # 连接挂一辈子。
     timeout = httpx.Timeout(connect=15, read=120, write=15, pool=15)
     while True:
         # Rebuild the client on every reconnect attempt with trust_env=False.

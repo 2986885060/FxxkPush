@@ -20,7 +20,12 @@ import httpx
 # ---------- config ----------
 NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
 _SECRET = Path(__file__).parent / "ntfy.secret"
-NTFY_TOKEN = os.environ.get("FP_NTFY_TOKEN") or (_SECRET.read_text().strip() if _SECRET.exists() else "")
+try:
+    NTFY_TOKEN = os.environ.get("FP_NTFY_TOKEN") or (
+        _SECRET.read_text().strip() if _SECRET.exists() else "")
+except Exception:
+    # 同 notification_listener：导入期读失败不该让 pythonw 无声退出。
+    NTFY_TOKEN = ""
 TOPICS = ["fp-vps", "fp-gray"]  # VPS hard alerts + gray-zone events
 
 import pclog
@@ -29,6 +34,25 @@ LOG = pclog.get_logger("pc_subscriber")
 
 def log(msg):
     pclog.log_auto(LOG, msg)
+
+
+def _auth() -> dict:
+    """鉴权头。**空 token 时不带头**，且每次取不到都会重试读文件。
+
+    空 ``Bearer `` 是非法头值 → httpx 抛 LocalProtocolError（TransportError），
+    在订阅热循环里每次重试都炸一遍（第 5 轮在 ai_triager 上确认的同型问题，
+    这里的 stream 是一模一样的循环）。不带头则服务端回 401/403 —— 那是
+    raise_for_status 能接住的正常异常，日志里也看得见。
+    """
+    global NTFY_TOKEN
+    if not NTFY_TOKEN:
+        try:
+            NTFY_TOKEN = (os.environ.get("FP_NTFY_TOKEN")
+                          or (_SECRET.read_text().strip()
+                              if _SECRET.exists() else ""))
+        except Exception:
+            return {}
+    return {"Authorization": f"Bearer {NTFY_TOKEN}"} if NTFY_TOKEN else {}
 
 # ---------- toast ----------
 _toaster = None
@@ -78,8 +102,7 @@ def toast(title, message, priority=3):
 def stream(client, topic):
     """Yield parsed events from one topic's JSON stream."""
     url = f"{NTFY_BASE}/{topic}/json"
-    with client.stream("GET", url, headers={
-            "Authorization": f"Bearer {NTFY_TOKEN}"}) as resp:
+    with client.stream("GET", url, headers=_auth()) as resp:
         resp.raise_for_status()
         for line in resp.iter_lines():
             if not line:
@@ -104,7 +127,12 @@ def run():
             # fails with WinError 10061 until the process is restarted. Our
             # traffic is loopback -> SSH tunnel, so it must never use a proxy.
             try:
-                with httpx.Client(timeout=httpx.Timeout(connect=15, read=None,
+                # read 不能是 None：和 ai_triager 第 4 轮那个 P1 是同一个坑 ——
+                # 半开连接（休眠唤醒/NAT 超时/网络切换，没发 FIN 也没 RST）会让
+                # iter_lines() 永久阻塞：无日志、不重连、watchdog 的 procs 检查
+                # 还是绿的，fp-vps/fp-gray 的消息一直丢到重启为止。ntfy 实测
+                # keepalive 45s 一次，120s 是它的 2.7 倍，不会误断健康连接。
+                with httpx.Client(timeout=httpx.Timeout(connect=15, read=120,
                                                         write=15, pool=15),
                                   trust_env=False) as client:
                     for ev in stream(client, topic):
@@ -148,7 +176,7 @@ def self_test():
                "message": "PC subscriber 自测：看到这条说明链路通",
                "priority": 4, "tags": ["zap"]}
     r = httpx.post(NTFY_BASE + "/", json=payload,
-                   headers={"Authorization": f"Bearer {NTFY_TOKEN}"},
+                   headers=_auth(),
                    timeout=10, trust_env=False)
     print("self-test publish:", r.status_code)
 

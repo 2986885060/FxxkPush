@@ -25,9 +25,34 @@ import httpx
 
 HERE = Path(__file__).parent
 NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
-NTFY_TOKEN = ((HERE / "ntfy.secret").read_text().strip()
-              if (HERE / "ntfy.secret").exists() else "")  # 与其他 3 个服务一致：缺 token 先跑起来，推送时 401 再报
-CFG = json.loads((HERE / "triage_config.json").read_text(encoding="utf-8"))
+try:
+    NTFY_TOKEN = ((HERE / "ntfy.secret").read_text().strip()
+                  if (HERE / "ntfy.secret").exists() else "")
+    CFG = json.loads((HERE / "triage_config.json").read_text(encoding="utf-8"))
+except Exception:
+    # 两个导入期读取都包进来：AV 独占 secret、或 triage_config.json 被手改
+    # 坏 —— 都发生在 excepthook 挂上之前，pythonw 下会无声退出（第 5 轮
+    # 同型问题，这是 4 处里的第 4 处）。CFG 给空 dict，下面全部用 .get 带
+    # 默认值，不会因此 KeyError。
+    NTFY_TOKEN = ""
+    CFG = {}
+
+
+def _auth() -> dict:
+    """鉴权头。**空 token 时不带头** + 每次取不到都重试读文件。
+
+    空 ``Bearer `` 是非法头值 → httpx LocalProtocolError（TransportError，
+    没有 .response）；不带头则服务端回 401，push() 的 except 接得住、
+    留日志（第 5 轮在 ai_triager 确认的同型问题）。
+    """
+    global NTFY_TOKEN
+    if not NTFY_TOKEN:
+        try:
+            p = HERE / "ntfy.secret"
+            NTFY_TOKEN = p.read_text().strip() if p.exists() else ""
+        except Exception:
+            return {}
+    return {"Authorization": f"Bearer {NTFY_TOKEN}"} if NTFY_TOKEN else {}
 ARCHIVE = HERE / "vision_log.jsonl"
 SEEN_STATE = HERE / "vision_state.json"
 SEEN_TTL = 6 * 3600  # don't re-report the same unread content for 6h
@@ -220,8 +245,10 @@ def bgra_to_png(bgra: bytes, w: int, h: int) -> bytes:
     """BGRA 原始数据 -> PNG bytes（给 MiMo 视觉 API 上传）。
 
     Pillow（C 实现）替代了原来的纯 Python 逐像素循环：800x600 实测
-    356.8ms -> 146.0ms（2.4x @800x600）；raw decoder 版 1200x800 见下方实测，且输出大小
-    不变（1408 vs 1407 KB —— 截图要走公网上传给 API，压缩率不能降）。
+    Pillow **5.0ms** vs 纯 Python **172.3ms = 34.4x**，两条路径输出逐像素
+    一致（第 4 轮实测；docstring 原来写的「356.8ms → 146.0ms（2.4x）」是
+    切片版的旧数据，那版代码从未执行过，留着会误导）。输出大小不变
+    （1408 vs 1407 KB —— 截图要走公网上传给 API，压缩率不能降）。
     纯红/纯绿/纯蓝三色解码校验过两条路径输出逐像素一致，通道顺序
     （BGRA -> RGB）没有错位。Pillow 不可用时回退原实现，vision 不会因
     缺依赖停摆。
@@ -327,7 +354,7 @@ def push(title, message, priority=4):
             "topic": "fp-pc", "title": title[:120], "message": message[:500],
             "priority": priority,
             "tags": pclog.tags_with_trace(["bell"]),
-        }, headers={"Authorization": f"Bearer {NTFY_TOKEN}"})
+        }, headers=_auth())
         return r.status_code == 200
     except Exception as e:
         log(f"ntfy error: {e!r}")
@@ -397,10 +424,21 @@ def handle(result: dict):
         fresh[chat] = (info, preview)
     _seen_save(seen)
 
+    failed_sigs = []
     for chat, (info, preview) in fresh.items():
         reason = info.get("reason", "")
         ok = push(f"{label}: {chat}", f"{preview}\n— {reason}", priority=4)
         log(f"{'PUSHED' if ok else 'PUSH_FAIL'} [{label}:{chat}] {reason}")
+        if not ok:
+            # push 失败必须回滚 seen —— 上面已经把 sig 记成「已上报」并落盘
+            # 了，不回滚的话这个 (chat, preview) 在 SEEN_TTL=6h 内不再重试，
+            # 这条未读最多静默 6 小时。ai_triager 的语义正是「推送失败就
+            # pop 掉快照」，两边对齐（第 5 轮）。
+            failed_sigs.append(_sig(app, chat, preview))
+    if failed_sigs:
+        for sig in failed_sigs:
+            seen.pop(sig, None)
+        _seen_save(seen)
 
 
 def main():
