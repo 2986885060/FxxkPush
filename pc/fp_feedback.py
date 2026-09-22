@@ -159,11 +159,22 @@ def _load_rules() -> dict:
             try:
                 loaded = json.loads(RULES_FILE.read_text(encoding="utf-8"))
                 fresh = loaded if isinstance(loaded, dict) else {"sources": {}}
-            except Exception as e:
+            except json.JSONDecodeError as e:
                 # 规则文件坏了最坏后果是回到「每条都问 AI」，不是停摆，
                 # 所以重置而不是崩 —— 和 triage_state 同样的取舍。
                 log(f"rules corrupt ({e!r}), resetting")
                 fresh = {"sources": {}}
+            except OSError as e:
+                # P2-5：**读失败 ≠ 文件损坏**。另一个进程正 rename / 读持句柄
+                # 时会撞 PermissionError，原来和损坏合并处理成 reset，还会把
+                # _rules_mtime 记成失败那一刻的 mtime —— 之后只要没人再写文件，
+                # 缓存就永远停在「空规则」：学到的静音静默失效、被静音的源重新
+                # 吵，而且再也不会重读（因为 mtime 已经相等了）。这里保留旧
+                # 缓存、**不更新 mtime**，下次调用自然重试。
+                log(f"rules read failed ({e!r}), keeping previous cache")
+                if isinstance(_rules_cache, dict):
+                    return _rules_cache
+                return {"sources": {}}
         # 「可解析但形状不对」也是损坏的一种：sources 要是字符串/列表，
         # 后面 should_ignore 的 .get(src) 和 _apply_rule 的 setdefault 都会
         # AttributeError，而那是在主链路里被调用的 —— 解析失败挡不住这一类。

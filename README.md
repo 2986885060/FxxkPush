@@ -172,6 +172,12 @@ pc/triage_config.json   # AI 配置，示例：
 
 > 每个服务在任务管理器里会显示成 **2 个进程**（venv 的 `pythonw.exe` 是个跳板，会派生真正的解释器），所以 6 个服务 = 12 个进程，这是正常的。
 
+> **venv 或项目目录变动后**（重建 `.venv`、把仓库挪到别的路径）：HKCU Run 的
+> 6 个自启项和 `start_services.PYW` 都**硬编码了 `.venv` 绝对路径**，路径一变
+> 6 项（含 watchdog）会一起静默失效且没有任何看护者会发现。改完务必重跑
+> `pc\install_autostart.bat`，再 `reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"`
+> 核对 6 条路径都指向新位置。
+
 手动单起（不推荐，会跳过健康门）：
 
 ```powershell
@@ -215,7 +221,7 @@ curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0
 | `pc/probe_notifications.py` | PC | 通知权限探测/诊断工具 |
 | `pc/pclog.py` | PC | 统一日志：单一格式（ISO 带日期 + level + 服务名 + trace_id）、单一出口（`pc/logs` + stderr）、RotatingFile 2MB×3、自动分级 |
 | `pc/start_services.py` | PC | 启动编排：杀旧 → 起隧道 → **健康门 `health=200`** → 起其余 → 校验 6×2 进程 |
-| `pc/watchdog.py` | PC (自启) | 管道自检：health / 进程 / 连接错误三项，连续 5 分钟不健康 → 绕过 AI 直推 fp-phone（本地隧道优先，失败走 SSH 兜底） |
+| `pc/watchdog.py` | PC (自启) | 管道自检：health / 进程 / 连接错误 / **磁盘**四项，连续 5 分钟不健康 → 绕过 AI 直推 fp-phone。告警走**三层降级**：本地隧道 → SSH 到 VPS → 本机 toast（零网络依赖，前两条共享同一个外部网络故障域，17:21 实测同时挂过）。进程死了还会在隧道健康时**自动拉起**；每轮写 `logs/watchdog.hb` 心跳文件，由 `notification_listener` 交叉检查（watchdog 没法监控它自己） |
 | `pc/restart_services.bat` | PC | 一键重启：调 `start_services.py`，带顺序与健康门 |
 | `vps_exec.py` | PC | SSH 执行助手：跑命令 / `--put` 上传（临时文件+原子替换，断线不会截断目标）/ `--get` |
 

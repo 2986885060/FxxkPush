@@ -116,11 +116,20 @@ def _seen_load() -> dict:
 def _seen_save(state: dict):
     now = time.time()
     state = {k: v for k, v in state.items() if now - v < SEEN_TTL}
+    # P2-4：tmp+replace，和 triage_state / seen(通知) 对齐。裸 write_text 写
+    # 一半断电会留半截 JSON，_seen_load 读坏返回 {} —— 下一轮把同一批未读
+    # **重复推送**（6 小时内）。
+    tmp = SEEN_STATE.with_name(f"{SEEN_STATE.name}.{os.getpid()}.tmp")
     try:
-        SEEN_STATE.write_text(json.dumps(state), encoding="utf-8")
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        tmp.replace(SEEN_STATE)
     except Exception as e:
         # 保存失败 = 这一轮的去重白存 -> 重启/下轮会重复识别并重复推送
         log(f"vision_state save failed: {e!r}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _sig(app: str, chat: str, preview: str) -> str:

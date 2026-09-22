@@ -116,8 +116,15 @@ def _gray_write(line: str) -> None:
 def gray(kind, data):
     """Gray-zone event: local spool + publish to fp-gray for the PC."""
     entry = {"ts": time.time(), "kind": kind, "data": data}
-    _gray_write(json.dumps(entry, ensure_ascii=False))
-    _publish(TOPIC_GRAY, f"灰区事件: {kind}", line, priority=1,
+    line = json.dumps(entry, ensure_ascii=False)
+    _gray_write(line)
+    # P2-11：message 用同一行 JSON。原实现引用了**不存在的变量 line** ->
+    # NameError，于是每条灰区事件（磁盘百分比变化 / OOM / 新 SSH IP / 非监控
+    # unit failed，以及 main 的 except 兜底）都会炸；main 的 except 里再调
+    # gray 会二次 NameError 直接穿透 -> 监控进程退出，而磁盘百分比几乎每小时
+    # 必变，部署后很快崩。PC 侧 watchdog 对 VPS 监控零覆盖，这一崩就全盲。
+    # （代码修复，**上 VPS 部署后才生效** —— 需要用户点头。）
+    _publish(TOPIC_GRAY, f"灰区事件: {kind}", line[:500], priority=1,
              tags=["eyes"])
 
 # ---------- hard rules ----------

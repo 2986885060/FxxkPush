@@ -26,6 +26,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import psutil
 import time
 from datetime import datetime
@@ -45,13 +46,29 @@ LINK_ERR_THRESHOLD = 3     # 这段时间内至少几条错误
 RENOTIFY = 1800            # 同一故障持续时最多重复提醒的秒数（防刷屏）
 HEARTBEAT_CYCLES = 10      # 每 10 轮（10 分钟）记一条心跳
 
-WATCHED = [                # 被监控的 5 个服务（watchdog 不监控自己）
+WATCHED = [                # 被监控的 5 个服务（watchdog 不监控自己，见 _log_crash）
     "ntfy_tunnel.py",
     "pc_subscriber.py",
     "notification_listener.py",
     "ai_triager.py",
     "wechat_vision_listener.py",
 ]
+
+PYW = HERE.parent / ".venv" / "Scripts" / "pythonw.exe"   # 和 start_services 同一个
+REVIVE_INTERVAL = 300     # 同一服务 5 分钟内只自动拉起一次（防拉起风暴）
+DISK_PCT = 90             # 磁盘使用率告警阈值（VPS 侧同值）
+HB = LOG_DIR / "watchdog.hb"   # 每轮心跳时间戳，给 notification_listener 交叉检查
+
+# 脚本名 -> pclog 服务名（日志文件名）。wechat 的日志叫 wechat_vision.log，
+# 和脚本名不一致，映射一次省得两处各写一遍。
+LOG_STEM = {
+    "ntfy_tunnel.py": "ntfy_tunnel",
+    "pc_subscriber.py": "pc_subscriber",
+    "notification_listener.py": "notification_listener",
+    "ai_triager.py": "ai_triager",
+    "wechat_vision_listener.py": "wechat_vision",
+}
+LINK_LOGS = [LOG_STEM[s] for s in WATCHED]   # check_link 要扫的全部日志
 
 import pclog
 LOG = pclog.get_logger("watchdog")
@@ -122,16 +139,77 @@ def _our_pythons() -> list[str]:
     return out
 
 
-def check_procs() -> tuple[bool, str]:
+def _counts() -> tuple[dict[str, int], int]:
+    """{脚本名: 进程数}, 枚举到的本项目 pythonw 总数。"""
     counts: dict[str, int] = {}
+    total = 0
     for cl in _our_pythons():
         m = re.search(r"([a-z_]+\.py)", cl)
         if m:
             counts[m.group(1)] = counts.get(m.group(1), 0) + 1
-    dead = [s for s in WATCHED if counts.get(s, 0) < 2]
-    if dead:
-        return False, f"进程缺失: {', '.join(dead)} (计数={counts})"
+            total += 1
+    return counts, total
+
+
+def check_procs() -> tuple[bool, str]:
+    # P2-1：判据从「< 2」改成「!= 2」。原来只查缺失 —— 并发双击两份编排
+    # 把每个服务起成 4 个进程时（双弹 toast、双次 AI 分诊、手机双推）这里
+    # 依然是绿的。上限同样算故障。
+    counts, _ = _counts()
+    missing = [s for s in WATCHED if counts.get(s, 0) < 2]
+    extra = [s for s in WATCHED if counts.get(s, 0) > 2]
+    parts = []
+    if missing:
+        parts.append(f"进程缺失 {missing}")
+    if extra:
+        parts.append(f"进程重复 {extra}")
+    if parts:
+        return False, "; ".join(parts) + f" (计数={counts})"
     return True, f"{len(WATCHED)} 服务进程齐"
+
+
+def _log_fresh(stem: str, secs: float) -> bool:
+    """该服务日志最近 secs 秒里还有没有新行 —— 进程枚举漏了它时的兜底判据。"""
+    lines = pclog.read_tail(LOG_DIR / f"{stem}.log", 5)
+    now = time.time()
+    for ln in reversed(lines):
+        ts = _log_ts(ln)
+        if ts is not None:
+            return now - ts <= secs
+    return False
+
+
+def revive_dead(now: float, last_revive: dict) -> None:
+    """P1-1：进程死了要拉起来，不能只发一条告警等人回办公室。
+
+    三条保守闸门，每条都是为了不制造比原故障更糟的双份进程：
+    1. 只在计数 **恰为 0** 时动手 —— 计数 1 可能是 shim 正在派生真身
+       （秒级），这时再起一份必然变成 3-4 个；计数 1 交给 check_procs 报警。
+    2. 枚举总数为 0 时不动手 —— 那多半是权限/安全软件把 cmdline 全挡了，
+       服务其实活着，按「全死」重启会造出双份。
+    3. 该服务日志 2 分钟内还有动静也不动手 —— 同样是「枚举漏了它」的信号。
+    同一服务 5 分钟内只重试一次，防止拉起失败变成每轮一次的进程风暴。
+    """
+    counts, total = _counts()
+    if total == 0:
+        return
+    for svc in WATCHED:
+        if counts.get(svc, 0) != 0:
+            continue
+        if _log_fresh(LOG_STEM[svc], 120):
+            continue
+        if now - last_revive.get(svc, 0) < REVIVE_INTERVAL:
+            continue
+        last_revive[svc] = now
+        try:
+            subprocess.Popen(
+                [str(PYW), str(HERE / svc)], cwd=str(HERE),
+                creationflags=(getattr(subprocess, "DETACHED_PROCESS", 0)
+                               | getattr(subprocess, "CREATE_NO_WINDOW", 0)))
+            LOG.warning(f"revive: {svc} 计数 0 且日志静默，已拉起"
+                        f"（{REVIVE_INTERVAL}s 内不重复拉）")
+        except Exception as e:
+            LOG.error(f"revive {svc} failed: {e!r}")
 
 
 def _log_ts(line: str) -> float | None:
@@ -151,19 +229,30 @@ _ERR_PAT = re.compile(
 
 
 def check_link() -> tuple[bool, str]:
-    """进程活着但连不上：最近 LINK_ERR_MIN 秒里错误刷屏、且没有成功日志。
+    """进程活着但在刷错：最近 LINK_ERR_MIN 秒里错误够多、正常日志压不住。
 
     抓的是 2026-09-22 那种形态 —— subscriber 进程健在、每 7 秒一条
     ConnectError，健康检查（隧道）却是绿的，只有日志知道它废了。
+
+    P0-1（第 6 轮）：原来只看 pc_subscriber / ai_triager 两个日志，
+    notification_listener（WinRT 权限被撤后每 3s 一条 poll error）和
+    wechat_vision（每轮 cycle error）一旦「进程活着但一直出错」，
+    procs 绿、health 绿、link 也不看它 —— 手机零告警、采集链路静默停摆
+    数天直到下次登录。现在 WATCHED 的 5 个日志全看。
+
+    判据从「errs>=3 且 oks==0」放宽到「errs>=3 且 (oks==0 或 errs>=oks)」：
+    原条件在「错误与正常日志并存」的半残状态下永远不成立（P2-8）——
+    典型是 fp-feedback 单流 401 退避到 600s、另三条流还在正常打 INFO，
+    反馈通道断半小时这里依然是绿的。
     """
     now = time.time()
     suspects = []
-    for svc in ("pc_subscriber", "ai_triager"):
-        p = LOG_DIR / f"{svc}.log"
+    for stem in LINK_LOGS:
+        p = LOG_DIR / f"{stem}.log"
         if not p.exists():
             continue
         # 只读尾部：原来是 read_text().splitlines()[-60:] —— 为了 60 行
-        # 把整个日志读进来。2MB 轮转阈值 x 2 个文件 x 每 60 秒一次 ≈ 5.7GB/天
+        # 把整个日志读进来。2MB 轮转阈值 x 5 个文件 x 每 60 秒一次 ≈ 14GB/天
         # 的纯磁盘读，全喂给页缓存。
         lines = pclog.read_tail(p, 60)
         if not lines:
@@ -177,14 +266,32 @@ def check_link() -> tuple[bool, str]:
                 errs += 1
             elif "[INFO" in ln or "[WARN" in ln:
                 oks += 1
-        if errs >= LINK_ERR_THRESHOLD and oks == 0:
-            suspects.append(f"{svc}: {errs} 条错误/0 条正常（近 {LINK_ERR_MIN//60}min）")
+        if errs >= LINK_ERR_THRESHOLD and (oks == 0 or errs >= oks):
+            suspects.append(f"{stem}: {errs} 条错误/{oks} 条正常"
+                            f"（近 {LINK_ERR_MIN//60}min）")
     if suspects:
         return False, "link " + "; ".join(suspects)
     return True, "link 正常"
 
 
-CHECKS = [("health", check_health), ("procs", check_procs), ("link", check_link)]
+def check_disk() -> tuple[bool, str]:
+    """P2-10：磁盘满了会先哑掉可观测性，而这里还是绿的。
+
+    写满时 logging 把异常吞在 handleError 里（日志静默丢失）、jsonl 归档和
+    state 写入全部失败 —— 去重失效变重复推送，watchdog 却 3/3 通过。
+    VPS 侧早有 df>=90% 检查，PC 侧一直缺这条。
+    """
+    try:
+        pct = psutil.disk_usage(str(HERE)).percent
+    except Exception as e:
+        return False, f"disk {type(e).__name__}: {e}"
+    if pct >= DISK_PCT:
+        return False, f"disk {pct}% >= {DISK_PCT}%（日志/state 写入会被静默吞掉）"
+    return True, f"disk {pct}%"
+
+
+CHECKS = [("health", check_health), ("procs", check_procs),
+          ("link", check_link), ("disk", check_disk)]
 
 
 # ------------------------------------------------- 告警通道（独立于隧道）
@@ -268,6 +375,23 @@ def push_vps(payload: dict) -> bool:
             pass
 
 
+def _record_echo(title: str, message: str) -> None:
+    """把弹出去的 toast 记进 toast_echo.jsonl，让 notification_listener 认出
+    这是自己人（P2-9）。
+
+    不记的话，watchdog 自己弹的告警 toast 会被 listener 当成新通知重新入队
+    分诊 —— 实测 18:17/18:18 有两条 ``PUSH [?] FxxkPush watchdog 通道测试``；
+    断网期间还会变成每 30 分钟一条必失败的 PUSH_FAIL，恢复后再补推一条过期
+    的「已恢复」。复用 pc_subscriber.record_echo（同一个文件、同一格式），
+    导入失败只降级成日志：回环指纹缺失的后果由 listener 侧兜底。
+    """
+    try:
+        from pc_subscriber import record_echo
+        record_echo(title, message)
+    except Exception as e:
+        LOG.warning(f"record echo failed (listener may re-triage this toast): {e!r}")
+
+
 def push_toast(title: str, message: str) -> bool:
     """Windows 原生 toast —— 零网络依赖，两条网络通道同时挂时的最后防线。
 
@@ -307,6 +431,7 @@ def push_toast(title: str, message: str) -> bool:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         out = (p.stdout or "").strip()
         if p.returncode == 0 and "SHOWN" in out:
+            _record_echo(title, message)   # 别让 listener 把这条告警再推一遍
             return True
         LOG.error(f"toast channel failed: rc={p.returncode} "
                   f"stderr={(p.stderr or '').strip()[:300]!r}")
@@ -348,10 +473,13 @@ def main() -> int:
     last_alert: dict[str, float] = {}   # name -> 上次告警时间
     cycle = 0
 
+    last_revive: dict[str, float] = {}   # svc -> 上次自动拉起时间
+
     while True:
         cycle += 1
         now = time.time()
         healthy_now = 0
+        health_ok = False
         for name, fn in CHECKS:
             try:
                 ok, detail = fn()
@@ -360,6 +488,8 @@ def main() -> int:
 
             if ok:
                 healthy_now += 1
+                if name == "health":
+                    health_ok = True
                 if name in fault_since:
                     dur = now - fault_since.pop(name)
                     LOG.info(f"{name} 恢复（故障持续 {fmt_dur(dur)}）")
@@ -381,7 +511,6 @@ def main() -> int:
             prev = last_alert.get(name, 0)
             if now - prev < RENOTIFY:
                 continue
-            last_alert[name] = now
             started = datetime.fromtimestamp(start).strftime("%Y-%m-%d %H:%M:%S")
             msg = (f"检查项: {name}\n"
                    f"详情: {detail}\n"
@@ -390,17 +519,63 @@ def main() -> int:
                    f"影响: {'全链路推送中断' if name == 'health' else '对应服务不可用'}\n"
                    f"排查: pc/logs/*.log")
             LOG.error(f"告警 {name}: {detail}")
-            send_alert(f"[FxxkPush] {name} 故障 {fmt_dur(dur)}", msg)
+            # P2-7：只有**真送出去**才记 last_alert。原实现在 send_alert
+            # 之前就打时间戳 —— 三条通道同时失败时（17:21 事故形态）同一
+            # 故障 1800s 内不再尝试，最坏把整轮告警全丢掉。失败就下一轮
+            # （60s 后）立刻重试。
+            if send_alert(f"[FxxkPush] {name} 故障 {fmt_dur(dur)}", msg):
+                last_alert[name] = now
+            else:
+                LOG.error(f"告警发送失败，下一轮重试: {name}")
+
+        # P1-1：隧道是通的才自动拉起死掉的服务 —— 和 start_services 的健康门
+        # 同一条哲学：隧道没就绪时把它们全拉起来，只会对着 2586 空转刷错
+        # （v0.3.0 之前那次启动顺序事故的形态），健康门失败时尤其不能补刀。
+        if health_ok:
+            revive_dead(now, last_revive)
 
         # 心跳：全绿时也留痕迹，否则 watchdog 静默运行时分不清它是健康还是已经死了
         if healthy_now == len(CHECKS) and cycle % HEARTBEAT_CYCLES == 0:
+            names = "/".join(n for n, _ in CHECKS)
             LOG.info(f"heartbeat: {len(CHECKS)}/{len(CHECKS)} 检查通过 "
-                     f"(health/procs/link) 第{cycle}轮")
+                     f"({names}) 第{cycle}轮")
+
+        # P0-2：每轮落一个心跳时间戳。watchdog 不在 WATCHED 里（它没法自己
+        # 监控自己），日志里那句 heartbeat 也没有任何消费者 —— 它一死，三项
+        # 巡检连同三层告警一起静默失效，而没有任何东西会发现。notification_listener
+        # 每 3 分钟看一眼这个文件的 mtime，超过 15 分钟没更新就替它喊人。
+        try:
+            HB.write_text(str(int(now)), encoding="utf-8")
+        except OSError as e:
+            LOG.warning(f"heartbeat file write failed: {e!r}")
 
         time.sleep(CHECK_INTERVAL)
 
 
+def _log_crash(exc_type, exc, tb) -> None:
+    """P0-2：watchdog 自己崩了必须留痕 + 尽力报警。
+
+    它是全系统唯一的看门人。没有 excepthook 的话，导入期/运行期异常在
+    pythonw 下既没控制台也进不了 pclog（异常直接打到无处可去的 stderr），
+    三层告警连同四项巡检一起静默失效，而这件事本身无人知晓 —— 这正是
+    第 6 轮报的 P0。先落日志，再走一遍告警降级链，最后退出。
+    """
+    import traceback
+    msg = "FATAL " + "".join(traceback.format_exception(exc_type, exc, tb)).strip()
+    try:
+        LOG.error(msg[-2000:])
+    except Exception:
+        pass
+    try:
+        send_alert("[FxxkPush] watchdog 自身崩溃",
+                   msg[-600:] + "\n\n三层告警与巡检已失效，请尽快重启 watchdog")
+    except Exception:
+        pass
+    os._exit(1)
+
+
 if __name__ == "__main__":
+    sys.excepthook = _log_crash
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:

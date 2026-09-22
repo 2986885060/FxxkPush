@@ -57,6 +57,20 @@ SELF_MARKERS = {"fuckpush", "fxxkpush", "winotify", "python", "pythonw"}
 ECHO_FILE = Path(__file__).parent / "toast_echo.jsonl"
 ECHO_WINDOW = 180  # seconds
 
+# P1-2：推失败的通知挂在这里下一轮重试（3s 一轮、每轮只出队一条）。
+# 失败最常发生在断网/隧道抖动时，而那恰恰是最需要送达的时刻 —— 原实现只写
+# 一行日志，等于「失败即永久丢失，要人工从 jsonl 里捞」。
+_pending: list[dict] = []
+PENDING_CAP = 200
+PENDING_TTL = 900         # 15 分钟还没推出去就放弃：更旧的通知没有打扰价值
+
+# P0-2：watchdog 每轮写 logs/watchdog.hb，这里每 3 分钟看一眼 mtime。
+# watchdog 不在它自己的 WATCHED 里（没法自我监控），日志里的 heartbeat 也
+# 没有消费者 —— 它一死，四项巡检连同三层告警一起静默失效。
+HB_FILE = Path(__file__).parent / "logs" / "watchdog.hb"
+_hb_alert_at = 0.0
+_seen_dirty = False       # save_seen 失败时置 True，下一轮继续重试落盘
+
 
 def _auth() -> dict:
     """鉴权头。**空 token 时不带头**，且每次取不到都会重试读文件。
@@ -156,7 +170,23 @@ def save_seen(seen, cap=2000):
         keep = sorted(seen, key=_key)[-cap:]
         seen.clear()
         seen.update(keep)
-    STATE.write_text(json.dumps(sorted(seen)), encoding="utf-8")
+    # P2-4：tmp+replace，和 triage_state / triage_rules 对齐。裸 write_text
+    # 写一半断电会留半截 JSON，而 load_seen 读坏直接返回空集 —— 等于全部 id
+    # 失忆，下一轮把通知中心里整批内容重推一遍。
+    # 返回是否成功：调用方靠它维持「脏」标记继续重试，否则这批 id 再也没机会
+    # 落盘（下轮 seen 长度不再变化，存盘条件就不成立了）。
+    tmp = STATE.with_name(f"{STATE.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(sorted(seen)), encoding="utf-8")
+        tmp.replace(STATE)
+        return True
+    except OSError as e:
+        log(f"save_seen failed ({e!r}) —— 本批 id 未落盘，下轮重试")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
 
 
 def extract(n) -> dict | None:
@@ -237,9 +267,97 @@ def publish(ev: dict):
         except Exception as e:
             log(f"archive write failed: {e!r}")
         log(f"{'PUSH' if ok else 'ARCH'} [{ev['app']}] {' | '.join(ev['texts'])[:80]}")
+        return ok
+
+
+def _enqueue(ev: dict) -> None:
+    """进重发队列（满了就丢并留痕，不能悄悄吞）。"""
+    ev.setdefault("_queued_at", time.time())
+    if len(_pending) < PENDING_CAP:
+        _pending.append(ev)
+    else:
+        log(f"pending 队列已满({PENDING_CAP})，丢弃 [{ev.get('app')}] "
+            f"{' | '.join(ev.get('texts') or [])[:60]}")
+
+
+def flush_pending() -> None:
+    """P1-2：每轮出队一条重试，失败回队尾（不阻塞后面的），超时放弃。"""
+    if not _pending:
+        return
+    ev = _pending.pop(0)
+    if time.time() - (ev.get("_queued_at") or 0) > PENDING_TTL:
+        log(f"drop pending [{ev.get('app')}] (>{PENDING_TTL}s): "
+            f"{' | '.join(ev.get('texts') or [])[:60]}")
+        return
+    if not publish(ev):
+        _enqueue(ev)
+
+
+def replay_failed(cap: int = 20) -> None:
+    """P1-2 的磁盘版：上次运行里 pushed:false 且还不太旧的，启动时补发一轮。
+
+    内存队列只覆盖本次进程活着的时候；进程崩溃 / 机器重启时，断网窗口里推
+    失败的那些只躺在 notifications.jsonl 里，从来没人回头看它（报告点名的
+    「恢复后不补发」）。
+
+    只读尾 60 行：补发本身会继续往同一个文件追加，读全量会变成自触发的
+    无限重放。ttl 过滤同时挡住「跨多次重启重复补发同一条」——旧的失败行
+    15 分钟后就自然过期了。
+    """
+    now = time.time()
+    done = 0
+    for ln in pclog.read_tail(ARCHIVE, 60):
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(rec, dict) or rec.get("pushed") is not False:
+            continue
+        if now - (rec.get("ts") or 0) > PENDING_TTL:
+            continue
+        if done >= cap:
+            break
+        ev = {"id": str(rec.get("id", "")), "app": rec.get("app", "?"),
+              "texts": rec.get("texts") or [], "ts": rec.get("ts") or now,
+              "watched": rec.get("watched", True)}
+        if publish(ev):
+            done += 1
+        else:
+            _enqueue(ev)
+    if done:
+        log(f"replay: 补发 {done} 条上次运行推送失败的通知")
+
+
+def check_watchdog_hb() -> None:
+    """P0-2：看门人也得有人看（交叉检查，进程独立于 watchdog）。"""
+    global _hb_alert_at
+    try:
+        age = time.time() - HB_FILE.stat().st_mtime
+    except OSError:
+        return          # 文件还没有 = watchdog 还没跑过第一轮，先不判（防开机误报）
+    if age < 900:
+        return
+    if time.time() - _hb_alert_at < 1800:
+        return          # 同一故障 30 分钟提醒一次，别刷屏
+    _hb_alert_at = time.time()
+    LOG.error(f"watchdog 心跳 {int(age)}s 未更新 —— 看门狗可能已死，告警能力失效")
+    try:
+        r = httpx.post(NTFY_BASE + "/", json={
+            "topic": "fp-phone",
+            "title": "[FxxkPush] watchdog 心跳超时",
+            "message": (f"watchdog.hb 已 {int(age // 60)} 分钟未更新，看门狗可能已退出："
+                        f"health/procs/link/disk 四项巡检与三层告警同时失效。\n"
+                        f"排查: pc/logs/watchdog.log，或直接跑 restart_services.bat"),
+            "priority": 4,
+            "tags": pclog.tags_with_trace(["rotating_light"]),
+        }, headers=_auth(), timeout=10, trust_env=False)
+        log(f"watchdog 心跳告警推送: HTTP {r.status_code}")
+    except Exception as e:
+        log(f"watchdog 心跳告警推送失败: {e!r}")
 
 
 async def main():
+    global _seen_dirty
     listener = UserNotificationListener.current
     access = await listener.request_access_async()
     if access != UserNotificationListenerAccessStatus.ALLOWED:
@@ -247,29 +365,54 @@ async def main():
         return 1
     log(f"notification access OK, polling every {POLL_SEC}s -> topic {TOPIC}")
 
+    first_run = not STATE.exists()
     seen = load_seen()
     log(f"loaded {len(seen)} known notification ids")
 
-    # first pass marks existing notifications as seen (no flood on startup)
-    for ev in await poll_once(listener, seen):
-        pass  # discarded: pre-existing
-    save_seen(seen)
-    log("startup snapshot marked as seen; listening for NEW notifications")
+    # P1-3：启动首遍原来对所有没见过的通知「既不发布也不归档、零日志、直接
+    # 标 seen」—— 崩溃/断电/重启停机窗口内到达的通知就这么静默消失，唯一
+    # 证据还留在 Windows 通知中心里。现在分两种情况：
+    #   - 首次运行（state 文件不存在）：通知中心躺着几天的存量，发出去是
+    #     洪水，照旧只做快照。
+    #   - 之后每次重启：这些是「服务没在时才到达」的，补发。cap 30 是给
+    #     state 被写坏导致 seen 清空那次兜底的 —— 那种情况下通知中心里全是
+    #     「没见过」的，不设上限等于把历史一股脑怼给手机。
+    pre = await poll_once(listener, seen)
+    if first_run:
+        log(f"first run: {len(pre)} 条存量通知标记为 seen（不发布）")
+    else:
+        for ev in pre[:30]:
+            publish(ev)
+        if len(pre) > 30:
+            log(f"补发最近 30 条，丢弃其余 {len(pre) - 30} 条 pre-existing")
+        elif pre:
+            log(f"补发停机窗口内到达的 {len(pre)} 条通知")
+    _seen_dirty = not save_seen(seen)
 
+    # P1-2：上次运行推失败（pushed:false）的补一轮
+    replay_failed()
+
+    tick = 0
     while True:
         try:
             before = len(seen)
             events = await poll_once(listener, seen)
             for ev in events:
-                publish(ev)
+                if not publish(ev):
+                    _enqueue(ev)     # 失败不丢：进队列，3s 后重试
+            flush_pending()
             # 按 seen 是否变化来存，不能只看 events：extract 返回 None 的
             # 通知（IGNORE 名单 / 自己弹的 toast）照样 add 了 id 却不产出
             # events。只在 events 非空时存盘，这批 id 下一轮又是"新的"，
-            # 每 3 秒重新 extract 一遍（含读 echo 文件）。
-            if events or len(seen) != before:
-                save_seen(seen)
+            # 每 3 秒重新 extract 一遍（含读 echo 文件）。_seen_dirty 是
+            # 上次落盘失败后的补记（P2-4）。
+            if events or len(seen) != before or _seen_dirty:
+                _seen_dirty = not save_seen(seen)
         except Exception as e:
             log(f"poll error: {e!r}")
+        tick += 1
+        if tick % 60 == 0:              # 每 3 分钟看一眼看门狗还活着没
+            check_watchdog_hb()
         await asyncio.sleep(POLL_SEC)
 
 

@@ -75,6 +75,18 @@ LOG = pclog.get_logger("ai_triager")
 # 每次 save_state 都多写一堆死数据 —— 反馈是低频事件，7 天足够。
 PUSH_TTL = 7 * 24 * 3600
 
+# P2-3：TTL 之外的第二道闸。TTL 只挡「老」挡不住「多」。
+PUSH_CAP = 500
+
+# P1-2：推失败的重发队列。push_phone 失败最常发生在隧道抖动 / 断网时，而那
+# 恰恰是「重要」消息最该送达的时候 —— 原实现失败即丢（连按钮快照一起 pop），
+# 只留一行 PUSH_FAIL 日志，等于要人工从 state/log 里捞。flush_pending 每 15s
+# 重试一条，超过 PENDING_TTL 才真放弃。
+_push_pending: list[dict] = []
+PENDING_CAP = 100
+PENDING_TTL = 900
+RETRY_INTERVAL = 15        # flush_pending 的重试节拍（抽成常量：测试要能调快）
+
 
 def log(msg):
     # file log: pythonw runs have no console, a crash must leave evidence.
@@ -160,6 +172,13 @@ def _prune_pushes(st: dict) -> None:
             continue
         if now - ts < PUSH_TTL:
             fresh[k] = v
+    # P2-3：TTL 之外再加硬上限，按 ts 保留最新 PUSH_CAP 条。TTL 只挡「老」，
+    # 挡不住「多」—— content 每条截 500、TTL 7 天，日均几百条重要推送时
+    # state 能长到 MB 级，而 save_state 在**每条消息的 finally** 里全量重写
+    # 它，写放大会跟着翻几倍。
+    if len(fresh) > PUSH_CAP:
+        fresh = dict(sorted(fresh.items(),
+                            key=lambda kv: kv[1].get("ts", 0))[-PUSH_CAP:])
     st["pushes"] = fresh
 
 
@@ -187,6 +206,21 @@ def load_state():
     # 报的冗余。
     _prune_pushes(st)
     return st
+
+
+def _clean_tmp() -> None:
+    """P2-3：清掉硬崩溃留下的孤儿临时文件（卡在 write 与 replace 之间那次）。
+
+    文件名都带 pid，进程死了就再也没人认领它们，不清理就是永久残留。只清
+    本模块自己那几种名字，不误伤别的文件。（正常失败路径自己会 unlink，
+    这里兜的是「unlink 之前进程就被 kill」的窗口。）
+    """
+    for p in HERE.glob(f"{STATE.name}.*.tmp"):
+        try:
+            p.unlink()
+            log(f"removed orphan tmp: {p.name}")
+        except OSError:
+            pass
 
 
 def save_state(st):
@@ -282,6 +316,34 @@ async def push_phone(client, title, message, priority=4, actions=None):
         # 而推送失败恰恰发生在网络抖动的时候 —— 断流等于雪上加霜。
         log(f"push_phone transport error: {e!r}")
         return False
+
+
+async def flush_pending(client, st):
+    """P1-2 �发：把推送失败的那条重新发一遍，超时才放弃。
+
+    与 consume 同生共死（由 main 挂进同一个 tasks 列表，client 重建时一起
+    cancel）。每 15s 出队一条：失败回**队尾**（不阻塞后面别的消息），成功就
+    丢弃；超过 PENDING_TTL 才清按钮快照并落盘 —— 那之后手机上不会再出现
+    这个 pid 的👍/👎，留着快照只会白占 7 天 state。
+    """
+    while True:
+        await asyncio.sleep(RETRY_INTERVAL)
+        if not _push_pending:
+            continue
+        item = _push_pending.pop(0)
+        if time.time() - item.get("ts", 0) > PENDING_TTL:
+            if item.get("pid"):
+                st["pushes"].pop(item["pid"], None)
+                save_state(st)
+            log(f"PUSH_GIVEUP (>{PENDING_TTL}s) [{item['title']}] "
+                f"{item['message'][:50]}")
+            continue
+        ok = await push_phone(client, item["title"], item["message"],
+                              actions=item.get("actions"))
+        if ok:
+            log(f"PUSH_RETRY ok [{item['title']}] {item['message'][:50]}")
+        else:
+            _push_pending.append(item)
 
 
 async def handle_event(client, st, topic, ev):
@@ -393,12 +455,22 @@ async def handle_event(client, st, topic, ev):
                 "content": content[:500], "label": label, "reason": reason,
             }
             _prune_pushes(st)
-        ok = await push_phone(client, src, f"{content[:200]}\n— {reason}",
-                              actions=actions)
-        if not ok and actions:
-            # 没推出去 = 手机上不会出现按钮 = 这个 pid 永远等不到反馈，
-            # 留着只是白占 7 天 state
-            st["pushes"].pop(pid, None)
+        msg = f"{content[:200]}\n— {reason}"
+        ok = await push_phone(client, src, msg, actions=actions)
+        if not ok:
+            # P1-2：失败不等于放弃 —— 挂进重发队列，flush_pending 每 15s 重试。
+            # 原实现是「失败即 pop 按钮快照」，断网窗口里的重要推送和它的
+            # 👍/👎 一起永久丢失。只有 PENDING_TTL 超时才清快照（在 flush 里）。
+            if len(_push_pending) >= PENDING_CAP:
+                dropped = _push_pending.pop(0)
+                if dropped.get("pid"):
+                    st["pushes"].pop(dropped["pid"], None)
+                log(f"push queue full, dropped oldest "
+                    f"push_id={dropped.get('pid')} [{dropped.get('title')}]")
+            _push_pending.append({"title": src, "message": msg,
+                                  "actions": actions,
+                                  "pid": pid if actions else None,
+                                  "ts": time.time()})
         log(f"{'PUSHED' if ok else 'PUSH_FAIL'} [{src}] {reason} "
             f"push_id={pid} {'+fb' if actions else ''} | {content[:50]}")
     else:
@@ -558,6 +630,7 @@ async def supervise(client, st, topic, max_fails: int = 12):
 
 async def main():
     log(f"triager up: model={CONFIG['model']}, out={TOPIC_OUT}")
+    _clean_tmp()                     # P2-3：先扫掉上次硬崩溃留下的孤儿 .tmp
     st = load_state()
     # read 不能是 None：那样 SSE 流**没有任何读超时**，网络路径静默失效
     # （休眠唤醒 / NAT 超时 / 网络切换，没发 FIN 也没 RST）时 aiter_lines()
@@ -586,6 +659,9 @@ async def main():
                 # 所以升级前必须显式 cancel 兄弟任务并等它们真的结束。
                 tasks = [asyncio.create_task(supervise(client, st, t))
                          for t in ALL_TOPICS]
+                # P1-2：重发任务和流任务同一批，client 重建时一起被 cancel
+                # （见下面 except 分支），不会留下拿着已关闭 client 的孤儿任务。
+                tasks.append(asyncio.create_task(flush_pending(client, st)))
                 try:
                     await asyncio.gather(*tasks)
                 except Exception:
