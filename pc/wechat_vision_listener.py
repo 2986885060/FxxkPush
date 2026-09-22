@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FxxkPush vision listener v0.3 — WeChat + WeCom (企业微信).
+"""FxxkPush vision listener v0.4 — WeChat + WeCom (企业微信).
 
 Every POLL minutes, screenshots both apps' main windows (parked
 off-screen) and sends them to MiMo vision for triage.
@@ -451,7 +451,7 @@ def handle(result: dict):
 
 
 def main():
-    log(f"vision listener v0.3: poll={POLL_MIN}min, active {ACTIVE_FROM}:00-{ACTIVE_TO}:00, targets={list(TARGETS)}")
+    log(f"vision listener v0.4: poll={POLL_MIN}min, active {ACTIVE_FROM}:00-{ACTIVE_TO}:00, targets={list(TARGETS)}")
     for app, cfg in TARGETS.items():
         info = find_window(cfg["class"], cfg["title"], cfg["min_w"])
         if info:
