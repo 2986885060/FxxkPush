@@ -86,13 +86,18 @@ def public_base() -> str:
 def _token() -> str:
     """读一次就缓存。每条重要推送都要调 build_actions，每轮读 2 个小文件
     虽然只有几十次/天，但和同模块为规则做 mtime 缓存的动机必须一致。
+
+    **失败不缓存**：AV/权限抖动让首次读失败就永久缓存成空串的话，本进程
+    之后所有推送永远没按钮、还没一行日志 —— 和 public_base() 里写明的取舍
+    （成功才缓存、失败留重试和告警）矛盾。宁可每条多读一次小文件。
     测试里直接替换 _token 这个函数对象即可绕过缓存。"""
     global _token_cache
     if _token_cache is None:
         try:
             _token_cache = (HERE / "ntfy.secret").read_text(encoding="utf-8").strip()
-        except Exception:
-            _token_cache = ""
+        except Exception as e:
+            log(f"ntfy.secret unreadable ({e!r}) —— 本轮推送不带反馈按钮")
+            return ""
     return _token_cache
 
 
@@ -128,8 +133,11 @@ def build_actions(push_id: str) -> list[dict] | None:
 
 # ---------------------------------------------------------------- 规则
 def _load_rules() -> dict:
-    """带 mtime 缓存地读规则。缓存失效只有写入方（本模块）自己触发，
-    单进程消费，不需要文件锁。"""
+    """带 mtime 缓存地读规则。缓存失效由写入方自己触发。
+
+    写方有两个（常驻服务 + 命令行 CLI），所以**不是**单进程：
+    读-改-写的并发最多互相覆盖一次反馈计数（可接受），临时名带 pid 防的
+    是「交错出半截 JSON」；文件共享层面的替换冲突见 _save_rules。"""
     global _rules_cache, _rules_mtime
     try:
         mtime = RULES_FILE.stat().st_mtime
@@ -178,7 +186,20 @@ def _save_rules(rules: dict) -> None:
     tmp = RULES_FILE.with_name(f"{RULES_FILE.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(rules, ensure_ascii=False, indent=1),
                    encoding="utf-8")
-    tmp.replace(RULES_FILE)
+    try:
+        tmp.replace(RULES_FILE)
+    except PermissionError:
+        # Windows 上读端（另一进程正 read_text 持着句柄）的瞬间 rename 会撞
+        # PermissionError。先清掉临时文件再抛，否则每失败一次留一个
+        # .<pid>.tmp 孤儿。上层：CLI 看到 traceback，服务侧被 handle 的 try
+        # 吃掉并记日志 —— 都比静默失败好。
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        log(f"rules replace failed (reader holds {RULES_FILE.name}) —— "
+            "本次规则更新未落盘，下次反馈重试")
+        raise
     _rules_cache = rules
     try:
         _rules_mtime = RULES_FILE.stat().st_mtime
@@ -205,11 +226,9 @@ def _apply_rule(src: str, verdict: str) -> None:
     rules = _load_rules()
     entry = rules.setdefault("sources", {}).setdefault(
         src, {"bad": 0, "good": 0, "verdict": None})
-    # 防「可解析但被手改成怪形状」：entry 不是 dict、bad 不是数字，
-    # 这里都要当成初值重来，否则 int() / [] 会在主链路里炸。
-    if not isinstance(entry, dict):
-        entry = {"bad": 0, "good": 0, "verdict": None}
-        rules["sources"][src] = entry
+    # entry 必是 dict：_load_rules 已把 sources 清成「值全是对象」，setdefault
+    # 的默认值也是 dict，两条入口都保证了（第 1 轮加的 isinstance 分支因此
+    # 不可达，第 3 轮删掉）。bad 不是数字仍可能（手改文件），下面继续防。
     try:
         prev_bad = int(entry.get("bad", 0) or 0)
         prev_good = int(entry.get("good", 0) or 0)
@@ -337,14 +356,15 @@ def stats(since: float | None = None) -> dict:
         if rec.get("ts", 0) < since:
             continue
         v = rec.get("verdict")
-        if v in ("good", "bad"):
-            out[v] += 1
         if not rec.get("matched"):
             out["unmatched"] += 1
-        src = rec.get("src") or "?"
-        bucket = out["by_src"].setdefault(src, {"good": 0, "bad": 0})
-        if v in bucket:
-            bucket[v] += 1
+        if v in ("good", "bad"):
+            # bucket 的键恰好就是 good/bad —— 不必再判一次 v in bucket
+            # （第 3 轮冗余）；顺带把建桶挪进这个 if，免得给非法 verdict
+            # 塞一个 0/0 的空桶。
+            out[v] += 1
+            src = rec.get("src") or "?"
+            out["by_src"].setdefault(src, {"good": 0, "bad": 0})[v] += 1
     return out
 
 
@@ -402,12 +422,17 @@ def _cli(argv: list[str]) -> int:
             e.pop("manual", None)  # 解锁入口等于没加（第 2 轮 P2）
             _save_rules(rules)
             print(f"已解除 [{a.src}] 的静音，误判计数已清零")
-    else:
+    elif a.cmd == "stats":
         s = stats()
         print(f"近 24h：👍 {s['good']}  👎 {s['bad']}  "
               f"未匹配 {s['unmatched']}")
         for name, b in sorted(s["by_src"].items()):
             print(f"  {name:<16} 👍{b['good']} 👎{b['bad']}")
+    else:
+        # argparse 已经把未知子命令拦在前面了，走到这只可能是「加了新命令却
+        # 忘了写分支」—— 那必须报错，不能静默打印统计（第 3 轮冗余）
+        print(f"未知命令 {a.cmd!r}")
+        return 2
     return 0
 
 

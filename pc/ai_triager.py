@@ -8,7 +8,10 @@ on pushes this service sent), asks MiMo to classify importance, and:
   - unimportant-> silent archive
 
 Repeats of the same source+content inside a sliding window are suppressed
-entirely (no API call, no push). Daily report at configured time.
+entirely (no API call, no push).
+
+注：triage_config.json 的 ``daily_report_time`` 和 state 里的 ``last_report``
+是**预留键，日报尚未实现**（见 README Roadmap），这里不声称有这功能。
 
 Runs alongside pc_subscriber.py / notification_listener.py.
 """
@@ -90,8 +93,20 @@ def _prune_pushes(st: dict) -> None:
         st["pushes"] = {}
         return
     now = time.time()
-    st["pushes"] = {k: v for k, v in pushes.items()
-                    if isinstance(v, dict) and now - v.get("ts", 0) < PUSH_TTL}
+    fresh = {}
+    for k, v in pushes.items():
+        # 内层 entry 也要校：ts 是字符串/None 时 `now - v.get("ts", 0)` 直接
+        # TypeError，而 _prune_pushes 跑在 load_state 里、任何 save_state
+        # **之前** —— 崩在这里状态文件永远不会被重写，有守护进程就是无限
+        # 崩溃循环（第 1 轮只校了外层是 dict，深度不够）。
+        if not isinstance(v, dict):
+            continue
+        ts = v.get("ts")
+        if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+            continue
+        if now - ts < PUSH_TTL:
+            fresh[k] = v
+    st["pushes"] = fresh
 
 
 def load_state():
@@ -115,7 +130,7 @@ def load_state():
         st["pushes"] = {}
     if not isinstance(st.get("last_report"), str):
         st["last_report"] = ""
-    _prune_pushes(st)
+    _prune_pushes(st)   # 内层 entry 的类型也在里面一并洗（见该函数注释）
     return st
 
 
@@ -155,10 +170,23 @@ def dedup_check(st, kind, content) -> str | None:
     src = re.sub(r"\s+", "", content)[:40]
     now = time.time()
     win = CONFIG["dedup_window_sec"]
-    st["recent"] = {k: v for k, v in st["recent"].items() if now - v["ts"] < win}
+    for k in list(st["recent"]):
+        v = st["recent"][k]
+        # 内层 entry 也要校：ts 缺失/非数值在这里就是 KeyError/TypeError，
+        # 而 dedup_check 在 handle_event 的 try 之内 —— 后果是**每一条**消息
+        # handle failed，服务看着活着，AI 路径其实全废（和第 2 轮给 recent
+        # 写的那句注释是同一类缺口，当时只校了外层是 dict）。
+        if not isinstance(v, dict) or not isinstance(v.get("ts"), (int, float)) \
+                or isinstance(v.get("ts"), bool):
+            del st["recent"][k]
+            continue
+        if now - v["ts"] > win:
+            del st["recent"][k]
     key = f"{kind}:{src}"
     if key in st["recent"]:
-        st["recent"][key]["count"] += 1
+        c = st["recent"][key].get("count")
+        st["recent"][key]["count"] = (
+            (c if isinstance(c, int) and not isinstance(c, bool) else 1) + 1)
         return None  # suppressed, count recorded
     st["recent"][key] = {"ts": now, "count": 1}
     return "pass"
@@ -190,13 +218,16 @@ async def handle_event(client, st, topic, ev):
     # ntfy carries everything as title+message text already
     title = (ev.get("title") or "").strip()
     body = (ev.get("message") or "").strip()
-    content = f"{title}\n{body}".strip()
+    # content 来源一次选好：原来先拼 f"{title}\n{body}".strip()，紧接着的
+    # fp-pc 分支（主流量）又用 content = body or title 整个覆盖 —— 白拼一次
+    # （第 3 轮冗余）。
     if topic == "fp-pc":
         # title shape: "QQ: sender" -> app = QQ, rest = sender
         src = title.split(":")[0].strip() if ":" in title else "Windows通知"
         content = body or title
     else:
         src = topic
+        content = (title + "\n" + body).strip() if body else title
 
     # HARD RULE: @所有人 / @我 always push (bypasses AI + dedup). The vision
     # listener flags these too, but the triager is the gate to the phone — if
@@ -252,8 +283,21 @@ async def handle_event(client, st, topic, ev):
         log(f"classify failed ({e!r}) -> fallback: push (safer to buzz)")
         verdict = {"label": "重要", "reason": "AI异常默认推送"}
 
-    label = verdict.get("label", "忽略")
-    reason = verdict.get("reason", "")
+    # label 归一化 + fail-open：模型返回「重要。」「重要 」这类变体是真实存在
+    # 的（classify 自己就在处理模型不守 fence）。精确匹配会让这些既不进 push
+    # 分支、也不触发 fallback —— 于是**静默归档成「忽略」**，方向正好和上面
+    # 「AI 异常默认推送 (safer to buzz)」相反，而漏推是本模块自认最坏的失败。
+    # 连 verdict 缺 label 键也一样：原来默认取 "忽略"，那是 fail-closed。
+    raw_label = verdict.get("label")
+    label = str(raw_label).strip().rstrip("。.！! ，,").strip() \
+        if raw_label is not None else ""
+    reason = str(verdict.get("reason", "") or "")
+    if label == "忽略":
+        pass
+    elif label != "重要":
+        reason = (f"未知判定 {raw_label!r}，按重要推送（fail-open）"
+                  + (f"；模型给的理由：{reason}" if reason else ""))
+        label = "重要"
     rec = {"ts": time.time(), "topic": topic, "src": src, "content": content,
            "label": label, "reason": reason}
     archive(rec)
@@ -293,28 +337,29 @@ async def handle_event(client, st, topic, ev):
 
 
 def _unwrap(ev: dict, body: str) -> dict:
-    """把裹在 message 字符串里的负载还原成 dict。
+    """把 message 字段还原成 ``{"title", "message", ...}``。绝不抛。
 
-    fp-pc 是 JSON、fp-gray 是 JSON、fp-vps 是纯文本，三种形状在这里统一成
-    {"title": ..., ...}。解析失败一律退回 {"title", "message"} 兜底，绝不抛。
-
-    顺带修掉一个边界：body 是合法 JSON 但不是对象（`null` / `123` / `"x"`）时，
-    原实现在 isinstance 检查失败后会让 parsed 保持 None，一路传到
-    handle_event 的 ev.get("title") 上炸 AttributeError。
+    实测两个发布方（notification_listener / wechat_vision_listener）发的
+    message 都是**纯文本**，所以绝大多数消息走的是最后那个兜底分支；JSON
+    分支目前是给「发布方哪天改发 JSON」留的活口，不是线上主路径。
+    解析不出来（不是 JSON、或压根不是字符串）一律退回原文兜底。
     """
     try:
-        maybe = json.loads(body)
-    except json.JSONDecodeError:
+        # isinstance 挡在前面：json.loads(None) 抛的是 **TypeError** 而不是
+        # JSONDecodeError（第 3 轮实测），只接后者会违背「绝不抛」的契约，
+        # 消息被 consume 吞掉、连归档都不做。
+        maybe = json.loads(body) if isinstance(body, str) else None
+    except (json.JSONDecodeError, TypeError):
         maybe = None
     if isinstance(maybe, dict):
         data = maybe.get("data")
         if isinstance(data, dict):
-            # 顶层键和 data 里的键**都要**：handle_event 拿 kind 当事件类型
-            # 标签（dedup 也用它分组），原来只 `{"title", **data}` 会把顶层的
-            # kind/ts 一起丢掉 —— fp-gray 的形状正是 {"ts","kind","data"}。
-            # message 兜底必须铺在最前，否则 fp-gray 的 data 里没有 message 键
-            # 时 handle_event 会拿到空 body，AI 分诊只剩个标签、内容全丢
-            # （第 2 轮 P2，既有缺陷，借这次抽出一并修）。
+            # 顶层键和 data 里的键都留着 —— 保守起见，不凭空丢数据。线上两个
+            # 发布方发的都是纯文本（根本走不到这个分支），而 handle_event 的
+            # kind 也是从 topic 派生、并不读 ev 里的 kind/ts（第 3 轮核过：
+            # 全仓库没有读取点，所以「丢顶层 kind/ts」当初是无效修复）。
+            # 真正有用的是那句 message 兜底：data 里没有 message 键时
+            # handle_event 会拿到空 body，AI 分诊只剩一个标签、内容全丢。
             # 顶层若带 message/title 则照旧覆盖，与 fp-pc 原行为一致。
             return {"title": ev.get("title", ""), "message": body,
                     **maybe, **data}
@@ -349,8 +394,6 @@ async def consume(client, st, topic):
             # 消息的 trace，grep 那条消息时会捞到一堆无关的重连错误
             # （pc_subscriber 已因同一个 bug 修过，这里是同一处漏网）。
             with pclog.trace(pclog.extract_trace(ev)):
-                # fp-pc arrives as JSON string inside message (from listener);
-                # fp-gray is our gray JSON; fp-vps is plain text
                 body = ev.get("message", "")
                 # 结构性兜底：单条消息失败绝不能断开 SSE —— 重连不回放，
                 # 断开的这几秒里该 topic 的消息会永久丢失。classify/push_phone
@@ -359,9 +402,10 @@ async def consume(client, st, topic):
                 # 否则同一条消息重连后会再分诊一次。
                 try:
                     if topic == fp_feedback.TOPIC:
-                        # 反馈分支不走 _unwrap：那层解析会把 {"verdict": ...}
-                        # 摊平、丢掉 message 键，handle 再 json.loads 一次就是
-                        # 白做功 + 拿不到东西（两边注释都记了这个坑）。
+                        # 反馈分支绕开 _unwrap 是为了**省一次白做的
+                        # json.loads**（handle 里还要按 push_id 解析一次），
+                        # 不是「拿不到东西」—— 新 _unwrap 已把 message 兜底
+                        # 铺在最前，走它也不会丢 message 键了。
                         fp_feedback.handle(st, body)
                     else:
                         await handle_event(client, st, topic, _unwrap(ev, body))
@@ -374,42 +418,49 @@ async def consume(client, st, topic):
 async def supervise(client, st, topic, max_fails: int = 12):
     """单条流的监督者：这条流挂了只重连它自己。
 
-    原来是 ``gather(*(consume(...)))``，而 asyncio.gather 默认**第一个异常
-    就向上传播并 cancel 其余任务**。fp-feedback 是全新链路（发布端实测过
-    不等于订阅端没问题），它一旦 401/404，另外三条主流会被一个自己用不到
-    的 topic 每 5 秒拖断一次 —— 而重连不回放，断开那几秒的消息永久丢失。
+    原来是 ``gather(*(consume(...)))``：任何一条流抛异常，gather 立刻向上传播，
+    main 的 ``async with`` 随即关掉 client。而**兄弟任务并不会被自动 cancel**
+    —— 第 3 轮用 Python 3.11 实测：抛出瞬间 ``sibling cancelled? False``，
+    要等事件循环退出才收尾（本函数早先的注释写反了，那是在复述一个想当然的
+    行为）。于是剩下几条会拿着已关闭的 client 各撞十几行假错误，最后那个
+    raise 还被已完成的 gather 用 fut.exception() 吞掉。main 里那段显式
+    cancel 就是补这个洞的。fp-feedback 是全新链路（发布端实测过不等于订阅端
+    没问题），它一旦 401/404，另外三条主流会被一个自己用不到的 topic 拖断 ——
+    而重连不回放，断开那几秒的消息永久丢失。
 
     连续失败攒到 max_fails（12 × 5s = 1 分钟）就往外抛，让 main 重建
     httpx client：client 级的故障（系统代理毒化那种）在流内小打小闹治不好，
     必须换掉整个客户端 —— 原 main 的重连逻辑正是为此存在，不能丢。
     """
     fails = 0
-    config_retries = 0
+    config_retries = 0      # 只在**成功消费一条**后复位：否则历史上只要发生过
+                            # 一次 4xx 退避，之后任何故障都会从封顶值起步
     while True:
         try:
             await consume(client, st, topic)
-            fails = 0  # 服务端主动断开也算一次干净收尾
+            fails = 0            # 服务端主动断开也算一次干净收尾
+            config_retries = 0   # 故障确实好了 —— 退避序列要从短的重新来
         except Exception as e:
             fails += 1
             log(f"[{topic}] stream error: {e!r} #{fails}, reconnect in 5s")
             if fails >= max_fails:
                 fails = 0
-                status = getattr(getattr(e, "response", None),
-                                 "status_code", None)
-                if status in (401, 403, 404, 410):
-                    # 配置级故障：换 client 一点用没有，可要是照旧 raise，
-                    # 4 条流会被这个自己用不到的 topic 每 ~65 秒整体拖断一次，
-                    # 而重连不回放 —— 断开那几秒的消息永久丢失（第 2 轮 P2）。
-                    # 改成让**这条流**自己指数退避，其余三条照常跑；不设上限，
-                    # 配置改好后的下一轮重试自然恢复，不做「永久放弃」——
-                    # 隧道断 80 分钟那种长故障不该把 topic 判死。
+                # 只要**拿到了 HTTP 响应**（4xx / 429 / 5xx 一视同仁），换
+                # client 就是白费：那是服务端或代理的事。第 2 轮只白名单
+                # 401/403/404/410，429 和 500 仍走 raise —— 持续超过 65 秒
+                # 时照样每 65 秒把 4 条流整体拖断，正是那个修复要消灭的模式。
+                # 判据改成「有没有 response」更准，也不用维护状态码清单。
+                if getattr(e, "response", None) is not None:
                     config_retries += 1
-                    delay = min(600, 30 * 2 ** min(config_retries, 5))
-                    log(f"[{topic}] HTTP {status} 配置级故障：单流退避 {delay}s"
+                    # 从 30s 起（上一版 30*2**n 首次算出 60s，off-by-one），
+                    # 30/60/120/240/480/600
+                    delay = min(600, 30 * 2 ** max(0, config_retries - 1))
+                    log(f"[{topic}] HTTP {getattr(e.response, 'status_code', '?')} "
+                        f"服务端/代理故障：单流退避 {delay}s"
                         f"（其余流不受影响，第 {config_retries} 次）")
                     await asyncio.sleep(delay)
                     continue
-                raise   # 传输级故障才升级：那才是换 client 能治的
+                raise   # 连都没连上 —— 隧道/客户端问题，那才该换 client
         await asyncio.sleep(5)   # 正常收尾也要等：否则服务端秒断会变成紧循环
 
 
@@ -426,10 +477,22 @@ async def main():
         # loopback tunnel and to the API directly, so never use a proxy.
         try:
             async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-                # 每条流在 supervise 里自己重连；这一层只处理 client 级故障
-                await asyncio.gather(
-                    *(supervise(client, st, t) for t in ALL_TOPICS)
-                )
+                # asyncio.gather 在子任务抛异常时**不取消**其余任务（第 3 轮
+                # 已用 3.11 实测：抛出瞬间 sibling cancelled? False，要等事件
+                # 循环退出才收尾）。而这里的 async with 随即 aclose() 掉 client
+                # —— 剩下 3 条会拿着已关闭的 client 各自撞约 12 行假错误，
+                # 最后那个 raise 还会被已完成的 gather 用 fut.exception() 吞掉。
+                # 所以升级前必须显式 cancel 兄弟任务并等它们真的结束。
+                tasks = [asyncio.create_task(supervise(client, st, t))
+                         for t in ALL_TOPICS]
+                try:
+                    await asyncio.gather(*tasks)
+                except Exception:
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    raise
         except Exception as e:
             log(f"client error: {e!r}, rebuilding client in 5s")
             await asyncio.sleep(5)
