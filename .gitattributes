@@ -1,0 +1,6 @@
+# Windows batch files MUST have CRLF endings — cmd.exe fails on LF:
+# it reports path fragments ('rvices', 'ndows') as unknown commands and
+# exits rc=255, which silently broke install_autostart.bat (only 5 of 6
+# Run entries got written). Pin the ending so it survives any checkout,
+# regardless of the local core.autocrlf setting.
+*.bat text eol=crlf
