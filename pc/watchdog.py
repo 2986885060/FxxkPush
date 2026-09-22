@@ -69,7 +69,7 @@ def check_health() -> tuple[bool, str]:
 
 
 def _our_pythons() -> list[str]:
-    """本项目的 pythonw 命令行（只认 fuckpush\pc\ 下的，不碰 Hermes 的解释器）。
+    """本项目的 pythonw 命令行（只认 fuckpush\\pc\\ 下的，不碰 Hermes 的解释器）。
 
     为什么不用 PowerShell：watchdog 由 pythonw 启动、自己没有控制台，子进程
     powershell.exe 会新建一个前台窗口，每 60 秒闪一次约两秒。更糟的是

@@ -68,7 +68,13 @@ def is_our_toast(texts) -> bool:
         for line in pclog.read_tail(ECHO_FILE, 60):
             if not line.strip():
                 continue
-            rec = json.loads(line)
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                # 单行损坏（写一半被杀 / 编码坏）不该让整个回环检测失效：
+                # 原来这里会冒泡到外层 except -> return False，之后窗口期内
+                # 自己弹出的 toast 全被当成新通知，直接重推一遍。
+                continue
             if rec.get("ts", 0) < cutoff:
                 continue
             fp = _norm(f'{rec.get("title", "")} {rec.get("msg", "")}')[:200]

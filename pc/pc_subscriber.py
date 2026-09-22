@@ -50,8 +50,10 @@ def record_echo(title, message):
             f.write(json.dumps({"ts": time.time(), "title": (title or "").strip(),
                                 "msg": (message or "").strip()},
                                ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    except Exception as e:
+        # 写失败 = 回环指纹缺失 -> notification_listener 认不出自己弹的 toast，
+        # 窗口期内会把它当新通知重推给手机。静默吞掉等于把回环藏起来。
+        log(f"record_echo failed (echo loop will misfire): {e!r}")
 
 
 def toast(title, message, priority=3):
