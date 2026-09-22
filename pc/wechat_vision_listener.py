@@ -79,7 +79,11 @@ sys.excepthook = _log_crash
 def _seen_load() -> dict:
     try:
         return json.loads(SEEN_STATE.read_text(encoding="utf-8"))
-    except Exception:
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        # state 坏掉 = 已推送指纹全丢 -> 下一轮把同一批消息再推一遍
+        log(f"vision_state unreadable ({e!r}); treating all as new")
         return {}
 
 
@@ -88,8 +92,9 @@ def _seen_save(state: dict):
     state = {k: v for k, v in state.items() if now - v < SEEN_TTL}
     try:
         SEEN_STATE.write_text(json.dumps(state), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as e:
+        # 保存失败 = 这一轮的去重白存 -> 重启/下轮会重复识别并重复推送
+        log(f"vision_state save failed: {e!r}")
 
 
 def _sig(app: str, chat: str, preview: str) -> str:
