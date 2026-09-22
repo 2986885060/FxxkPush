@@ -19,7 +19,7 @@ from __future__ import annotations
 import base64
 import json
 import re
-import subprocess
+import psutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -69,19 +69,28 @@ def check_health() -> tuple[bool, str]:
 
 
 def _our_pythons() -> list[str]:
-    """本项目的 pythonw CommandLine（按名过滤，不碰 Hermes 的解释器）。"""
-    ps = ("Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" | "
-          "Where-Object { $_.CommandLine -like '*fuckpush\\pc\\*' } | "
-          "Select-Object -ExpandProperty CommandLine")
-    try:
-        r = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps],
-                           capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=30)
-    except Exception:
-        return []
-    if r.returncode != 0:
-        return []
-    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    """本项目的 pythonw 命令行（只认 fuckpush\pc\ 下的，不碰 Hermes 的解释器）。
+
+    为什么不用 PowerShell：watchdog 由 pythonw 启动、自己没有控制台，子进程
+    powershell.exe 会新建一个前台窗口，每 60 秒闪一次约两秒。更糟的是
+    PowerShell 一旦被安全软件拦截返回空，check_procs 会把 5 个服务全判成死，
+    然后对着手机发一条纯误报的告警。psutil 是进程内遍历：无子进程、无窗口。
+
+    process_iter 只取 name：cmdline 要逐个开进程句柄，对全系统几百个进程都取
+    一次要 2 秒（还含大量 SYSTEM 进程 AccessDenied）；先按 name 过滤、再只对
+    十几个 pythonw 取 cmdline，约 15ms。实测 15ms vs PowerShell 冷启动 3.5 秒。
+    """
+    out = []
+    for p in psutil.process_iter(["name"]):
+        try:
+            if (p.info.get("name") or "").lower() != "pythonw.exe":
+                continue
+            cmd = " ".join(p.cmdline() or [])
+            if "fuckpush\\pc\\" in cmd.lower():
+                out.append(cmd)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return out
 
 
 def check_procs() -> tuple[bool, str]:
