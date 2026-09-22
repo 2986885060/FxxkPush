@@ -85,23 +85,38 @@ def _publish(topic, title, message, priority=4, tags=None):
     code = p.stdout.decode().strip()
     if code != "200":
         # never die on push failure; local spool as fallback
-        GRAY_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with GRAY_LOG.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": time.time(), "kind": "ntfy-push-failed",
+        _gray_write(json.dumps({"ts": time.time(), "kind": "ntfy-push-failed",
                                 "data": {"http_code": code, "title": title}},
-                               ensure_ascii=False) + "\n")
+                               ensure_ascii=False))
     return code == "200"
 
 def push(title, message, priority=4, tags=None):
     return _publish(TOPIC_HARD, title, message, priority, tags)
 
+def _gray_write(line: str) -> None:
+    """Append one spool line to gray.log, rotating past 512KB -> .1.
+
+    PC-side review round 4 gave all four jsonls a rotation cap and left this
+    file as "deploy together next time" — this is that change. append-only
+    with no cap means dozens of MB a year of gray-zone spool on a 1C1G box.
+    Rotation failure must not drop the line being written, hence the guard.
+    """
+    GRAY_LOG.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if GRAY_LOG.exists() and GRAY_LOG.stat().st_size > 512 * 1024:
+            bak = GRAY_LOG.with_name(GRAY_LOG.name + ".1")
+            bak.unlink(missing_ok=True)
+            GRAY_LOG.replace(bak)
+    except Exception:
+        pass
+    with GRAY_LOG.open("a", encoding="utf-8") as f:
+        f.write(line if line.endswith("\n") else line + "\n")
+
+
 def gray(kind, data):
     """Gray-zone event: local spool + publish to fp-gray for the PC."""
     entry = {"ts": time.time(), "kind": kind, "data": data}
-    line = json.dumps(entry, ensure_ascii=False)
-    GRAY_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with GRAY_LOG.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    _gray_write(json.dumps(entry, ensure_ascii=False))
     _publish(TOPIC_GRAY, f"灰区事件: {kind}", line, priority=1,
              tags=["eyes"])
 
