@@ -14,9 +14,13 @@
                             必须防御，否则进程启动即崩）
 
 trace_id：
-    消息经 ntfy 中转时靠 header ``X-Fp-Trace`` 贯穿（消息体可能是纯文本，
-    塞 JSON 不通用）。发布方 set_trace_id()，订阅方从 header 取出来再 set，
-    中间每一跳的日志都会带上同一串 id，一条消息的完整链路用 grep 就能拉出来。
+    ntfy 只透传已知字段 —— 自定义 header（X-Fp-Trace）和未知 JSON 字段
+    （trace_id / sequence_id）都会被服务端静默丢弃（实测 HTTP 200，但订阅端
+    收不到），唯一能带着元数据跨进程走的只有 tags。所以 trace 寄生在 tags 里，
+    形如 ``t_ab12cd34``：发布方用 tags_with_trace() 挂上，订阅方用
+    extract_trace() 配合 ``with trace(...)`` 取下（块结束自动恢复 —— 直接
+    bind 不恢复的话，一条消息的 trace 会泄漏到后面的重连错误上）。
+    中间每一跳的日志都带同一串 id，grep 一次拉出全链路。
 
 用法::
 
@@ -165,6 +169,26 @@ def get_logger(service: str, level: int = logging.INFO) -> logging.Logger:
     return logger
 
 
+def read_tail(path, n: int = 60, max_bytes: int = 65536) -> list[str]:
+    """只读文件末尾 max_bytes，返回最后 n 行（str 列表）。
+
+    check_link / is_our_toast 这类"只看最近几行"的检查，原来写的是
+    ``read_text().splitlines()[-60:]`` —— 为了 60 行把整个文件读进来。
+    2MB 的日志轮转阈值 x 2 个文件 x 每 60 秒一次 ≈ 5.7GB/天的纯磁盘读，
+    全喂给页缓存还拖着 CPU。从尾部 seek 一次只碰 64KB。
+    """
+    try:
+        size = Path(path).stat().st_size
+        with Path(path).open("rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+                f.readline()      # 丢掉可能被截断的半行
+            data = f.read().decode("utf-8", "replace")
+        return data.splitlines()[-n:]
+    except Exception:
+        return []
+
+
 def tags_with_trace(tags=None) -> list:
     """给 ntfy payload 的 tags 挂上当前 trace_id（替掉已有的，避免累积）。
 
@@ -202,6 +226,12 @@ def bind_from_event(ev) -> str:
     优先 tags（发起方带过来的）；没有就用 ntfy 消息 id 派生 —— 同一条消息
     在多个订阅方（subscriber / triager 都订 fp-vps）拿到的 id 相同，
     链路照样对得上，VPS 侧纯文本告警也能追溯。
+
+    警告：本函数**绑定后不恢复**。长驻进程里直接调它，之后的周期日志和重连
+    错误都会挂上最后一条消息的 trace（2026-09-22 实测 grep 一条消息时捞到
+    无关的 ReadError，就是这么来的）。要恢复就用
+    ``with pclog.trace(pclog.extract_trace(ev)):``；一次性进程或明确不需要
+    恢复的场景才用本函数。
     """
     return set_trace_id(extract_trace(ev))
 
