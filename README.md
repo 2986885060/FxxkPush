@@ -144,9 +144,9 @@ pc/ntfy.secret          # 一行：ntfy token（tk_xxx）
 pc/triage_config.json   # AI 配置，示例：
 {
   "provider": "mimo",
-  "base_url": "https://api.xiaomimimo.com/v1",
+  "base_url": "OCR模型端点",
   "api_key": "sk-你的key",
-  "model": "mimo-v2.5",
+  "model": "任意OCR模型",
   "wechat_poll_min": 30,
   "wechat_my_name": "你的微信昵称",
   "dedup_window_sec": 1800,
