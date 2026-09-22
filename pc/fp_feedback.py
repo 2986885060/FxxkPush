@@ -198,21 +198,24 @@ def _save_rules(rules: dict) -> None:
     global _rules_cache, _rules_mtime
     rules["updated"] = time.time()
     tmp = RULES_FILE.with_name(f"{RULES_FILE.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(rules, ensure_ascii=False, indent=1),
-                   encoding="utf-8")
     try:
+        # write_text 也在 try 里：磁盘满 / AV 拦截时它自己抛 OSError，原来
+        # 落在 try 外面，每失败一次就永久留一个 .<pid>.tmp 孤儿（跨重启没人
+        # 认领也没人清理）。和 r4 给 save_state 做的「日志 + unlink + 不抛」
+        # 是同一类路径，两处必须一致（第 5 轮）。
+        tmp.write_text(json.dumps(rules, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
         tmp.replace(RULES_FILE)
-    except PermissionError:
-        # Windows 上读端（另一进程正 read_text 持着句柄）的瞬间 rename 会撞
-        # PermissionError。先清掉临时文件再抛，否则每失败一次留一个
-        # .<pid>.tmp 孤儿。上层：CLI 看到 traceback，服务侧被 handle 的 try
-        # 吃掉并记日志 —— 都比静默失败好。
+    except OSError:
+        # 两类都会走到这里：write_text 自身失败（磁盘满/AV），以及 Windows
+        # 上读端（另一进程正 read_text 持着句柄）的瞬间 rename 撞
+        # PermissionError。先清掉临时文件再抛。上层：CLI 看到 traceback，
+        # 服务侧被 handle 的 try 吃掉并记日志 —— 都比静默失败好。
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
-        log(f"rules replace failed (reader holds {RULES_FILE.name}) —— "
-            "本次规则更新未落盘，下次反馈重试")
+        log(f"rules save failed —— 本次规则更新未落盘，下次反馈重试")
         raise
     _rules_cache = rules
     try:
@@ -224,11 +227,12 @@ def _save_rules(rules: dict) -> None:
 def should_ignore(src: str) -> bool:
     """主链路的快速路：True = 这个源已判定为噪音，连 AI 都不用问。
 
-    isinstance 的实际作用只剩兜 ``.get(src)`` 拿不到键时的 None ——
-    「值不是对象」那个形状 _load_rules 读端已经洗掉了，这里不是为它服务的
-    （第 4 轮更正：注释原来声称是纵深防御，会误导后续维护）。仍留在这个
-    调用在 classify 的 try 之外，冒出去会被 consume 吞掉，那条消息连归档
-    都不归档，比「回到每条问 AI」更糟。
+    isinstance 只剩兜 ``.get(src)`` 拿不到键时的 None ——「值不是对象」那个
+    形状 _load_rules 读端已经洗掉了，这里不是为它服务的（第 4 轮更正：
+    注释原来声称是纵深防御，会误导后续维护）。
+
+    这个调用在 classify 的 try 之外，异常冒出去会被 consume 吞掉，那条
+    消息连归档都不归档，比「回到每条问 AI」更糟。
     """
     if not src:
         return False

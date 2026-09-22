@@ -26,7 +26,15 @@ from winrt.windows.ui.notifications.management import (
 # ---------- config ----------
 NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
 _SECRET = Path(__file__).parent / "ntfy.secret"
-NTFY_TOKEN = os.environ.get("FP_NTFY_TOKEN") or (_SECRET.read_text().strip() if _SECRET.exists() else "")
+try:
+    NTFY_TOKEN = os.environ.get("FP_NTFY_TOKEN") or (
+        _SECRET.read_text().strip() if _SECRET.exists() else "")
+except Exception:
+    # 导入期读取包 try：AV 在 exists() 和 read_text() 之间独占一下就足以
+    # 让进程在 excepthook 挂上之前无声退出（pythonw 下连日志都没有）。
+    # 空 token 先跑起来，_auth() 不带头、服务端回 401，上层的
+    # `ntfy publish failed` 日志会留痕（第 5 轮同型问题）。
+    NTFY_TOKEN = ""
 TOPIC = "fp-pc"
 POLL_SEC = 3
 ARCHIVE = Path(__file__).parent / "notifications.jsonl"
@@ -48,6 +56,25 @@ SELF_MARKERS = {"fuckpush", "fxxkpush", "winotify", "python", "pythonw"}
 # so match on content instead of app identity.
 ECHO_FILE = Path(__file__).parent / "toast_echo.jsonl"
 ECHO_WINDOW = 180  # seconds
+
+
+def _auth() -> dict:
+    """鉴权头。**空 token 时不带头**，且每次取不到都会重试读文件。
+
+    空 ``Bearer `` 是非法头值 → httpx 抛 LocalProtocolError（TransportError，
+    没有 .response），except 接得住但日志里只有一行不知所云的异常；不带头
+    则服务端回 401/403，`ntfy publish failed: ... 401` 一眼能看懂（第 5 轮
+    在 ai_triager 上确认的同型问题，其余三个服务同批修）。
+    """
+    global NTFY_TOKEN
+    if not NTFY_TOKEN:
+        try:
+            NTFY_TOKEN = (os.environ.get("FP_NTFY_TOKEN")
+                          or (_SECRET.read_text().strip()
+                              if _SECRET.exists() else ""))
+        except Exception:
+            return {}
+    return {"Authorization": f"Bearer {NTFY_TOKEN}"} if NTFY_TOKEN else {}
 
 
 def _norm(s: str) -> str:
@@ -197,7 +224,7 @@ def publish(ev: dict):
         }
         try:
             r = httpx.post(NTFY_BASE + "/", json=payload,
-                           headers={"Authorization": f"Bearer {NTFY_TOKEN}"},
+                           headers=_auth(),
                            timeout=10, trust_env=False)
             ok = r.status_code == 200
         except Exception as e:
