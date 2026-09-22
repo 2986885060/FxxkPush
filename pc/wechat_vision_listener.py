@@ -468,6 +468,7 @@ def main():
             time.sleep(600)
             continue
         time.sleep(POLL_MIN * 60)
+        scanned = 0
         for app, cfg in TARGETS.items():
             # 每轮每个 app 一个 trace：截图、识别、推送、归档全用同一个 id，
             # 出问题时 grep 一次就能拉出这一轮的完整过程
@@ -476,10 +477,15 @@ def main():
                 result = scan_app(app, cfg)
                 if result:
                     handle(result)
+                scanned += 1
             except Exception as e:
                 log(f"[{app}] cycle error: {e!r}")
             finally:
                 pclog.set_trace_id("-")   # 不把 trace 带到下一轮/静默期日志
+        # r7-10：一轮扫完（有无新消息都算）留一条心跳 —— 原来「正常但没新消息」
+        # 零日志，和「截图失败但被吞 / 循环卡死」同形。watchdog 的 quiet 检查
+        # （阈值 2700s）靠这条判断 30min 轮询还活着。
+        log(f"idle heartbeat: cycle done, {scanned}/{len(TARGETS)} apps scanned")
 
 
 if __name__ == "__main__":

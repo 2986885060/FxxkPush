@@ -285,7 +285,8 @@ def flush_pending() -> None:
     if not _pending:
         return
     ev = _pending.pop(0)
-    if time.time() - (ev.get("_queued_at") or 0) > PENDING_TTL:
+    age = time.time() - (ev.get("_queued_at") or 0)
+    if age > PENDING_TTL or age < 0:
         log(f"drop pending [{ev.get('app')}] (>{PENDING_TTL}s): "
             f"{' | '.join(ev.get('texts') or [])[:60]}")
         return
@@ -306,15 +307,29 @@ def replay_failed(cap: int = 20) -> None:
     """
     now = time.time()
     done = 0
+    # r7-4：publish 每次调用都归档一条新记录 —— 失败那条 pushed:false 永久
+    # 留在文件里，重试成功只**追加**一条 pushed:true，不回填也不作废旧记录。
+    # 原实现只过滤 pushed is False，于是 15 分钟窗口内任何重启都会把已经成功
+    # 推送过的那条再推一次（手机收到同一条两次）+ 归档重复行。这里先按 id
+    # 建索引、同 id 只认**时间最新**那条的 pushed，旧的 false 行自动被 true
+    # 行压掉。read_tail 是文件序，后面的更新，直接覆盖即可。
+    latest: dict[str, dict] = {}
     for ln in pclog.read_tail(ARCHIVE, 60):
         try:
             rec = json.loads(ln)
         except Exception:
             continue
-        if not isinstance(rec, dict) or rec.get("pushed") is not False:
+        if not isinstance(rec, dict):
             continue
-        if now - (rec.get("ts") or 0) > PENDING_TTL:
+        rid = str(rec.get("id", ""))
+        if rid:
+            latest[rid] = rec
+    for rec in latest.values():
+        if rec.get("pushed") is not False:
             continue
+        age = now - (rec.get("ts") or 0)
+        if age > PENDING_TTL or age < 0:
+            continue      # 太旧不补；负数 = 时间回拨过的脏数据，跳过 (r7-8)
         if done >= cap:
             break
         ev = {"id": str(rec.get("id", "")), "app": rec.get("app", "?"),
@@ -337,8 +352,11 @@ def check_watchdog_hb() -> None:
         return          # 文件还没有 = watchdog 还没跑过第一轮，先不判（防开机误报）
     if age < 900:
         return
-    if time.time() - _hb_alert_at < 1800:
-        return          # 同一故障 30 分钟提醒一次，别刷屏
+    gap = time.time() - _hb_alert_at
+    if 0 <= gap < 1800:
+        return          # 同一故障 30 分钟提醒一次，别刷屏；
+                        # 负数 = 系统时间被回拨过 (r7-8)：视为已过期，继续报，
+                        # 宁可多喊一次也好过告警被永久静音
     _hb_alert_at = time.time()
     LOG.error(f"watchdog 心跳 {int(age)}s 未更新 —— 看门狗可能已死，告警能力失效")
     try:
@@ -382,7 +400,10 @@ async def main():
         log(f"first run: {len(pre)} 条存量通知标记为 seen（不发布）")
     else:
         for ev in pre[:30]:
-            publish(ev)
+            # r7-4：原实现忽略返回值 —— 断网时启动补发整批静默失败，
+            # 既不入 _pending 也无本轮重试，等于要再重启一次才补得出来。
+            if not publish(ev):
+                _enqueue(ev)
         if len(pre) > 30:
             log(f"补发最近 30 条，丢弃其余 {len(pre) - 30} 条 pre-existing")
         elif pre:
@@ -413,6 +434,13 @@ async def main():
         tick += 1
         if tick % 60 == 0:              # 每 3 分钟看一眼看门狗还活着没
             check_watchdog_hb()
+        if tick % 100 == 0:
+            # r7-10：事件驱动 + WinRT 权限被撤后 get_notifications 返回空也
+            # 不留痕，「活着但没干活」和「健康」在日志上完全同形（实测 6 小时
+            # 才 74 行）。每 5 分钟一条固定心跳，watchdog 的 quiet 检查才有
+            # 判据可依。
+            log(f"idle heartbeat: seen={len(seen)} pending={len(_pending)} "
+                f"watchdog_hb_ok")
         await asyncio.sleep(POLL_SEC)
 
 

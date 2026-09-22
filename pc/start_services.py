@@ -49,6 +49,9 @@ def _token() -> str:
     return p.read_text().strip() if p.exists() else ""
 
 
+_denied = [0]          # cmdline 读不到(AccessDenied) 的进程数（r7-12）
+
+
 def _our_procs(include_self: bool = True) -> list[tuple[int, str]]:
     """[(pid, cmdline), ...] 本项目的 pythonw（shim + 真身都算）。
 
@@ -72,7 +75,13 @@ def _our_procs(include_self: bool = True) -> list[tuple[int, str]]:
             if not include_self and "start_services" in low:
                 continue          # 不杀自己
             out.append((proc.pid, cmd))
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        except psutil.AccessDenied:
+            # r7-12：单独计数。原来和 NoSuchProcess 混在一起 continue，
+            # 提权会话下 cmdline 读不到 = 活进程被当成不存在，最后误报
+            # 「进程缺失」并 return 1（其实服务好好的）。
+            _denied[0] += 1
+            continue
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
             continue
     return out
 
@@ -148,14 +157,53 @@ def verify_procs() -> dict[str, int]:
     return counts
 
 
-def main() -> int:
+LOCK = HERE / ".start_services.lock"
+
+
+def _acquire_lock() -> bool:
+    """O_EXCL 单例锁（r7-12）：并发双击 restart bat 会起两份编排，kill/start
+    交错出 4 实例且互不知情。锁文件带 pid；持有者已死（陈旧锁）自动接管。"""
+    import errno
+    for _ in range(2):                 # 最多试两次（第二次是清掉陈旧锁之后）
+        try:
+            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return True
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                LOG.warning(f"lock create failed ({e!r})，按无锁继续")
+                return True
+            try:
+                holder = int(LOCK.read_text().strip() or "0")
+                psutil.Process(holder)          # 持有者还活着
+                return False
+            except (ValueError, psutil.NoSuchProcess, OSError):
+                try:
+                    LOCK.unlink()               # 陈旧锁：上一次跑一半被 kill
+                except OSError:
+                    return False
+    return False
+
+
+def _main() -> int:
     LOG.info("=" * 60)
     LOG.info("FxxkPush 启动编排开始")
     pclog.set_trace_id(None)
 
     # 1) 清场
     LOG.info("停掉旧进程")
-    kill_ours()
+    left = kill_ours()
+    if left:
+        # r7-12：残留进程没退出就继续 start，新旧同脚本并存 = 双写日志、
+        # 双份服务（双 toast、双分诊、手机双推、抢 state 文件）。原来只
+        # warning 照样往下走，watchdog 事后只会报「进程重复」且无人回收。
+        LOG.error(f"{len(left)} 个旧进程杀不掉，中止本轮启动（避免双份）")
+        print(f"\n[失败] {len(left)} 个旧进程无法终止，已中止启动：")
+        for c in left:
+            print(f"  - {c[:120]}")
+        print("\n等它们自己退出（或任务管理器结束）后再跑一次。")
+        return 3
     time.sleep(1.0)
 
     # 2) 隧道先行 + 健康门（核心：不验 health=200 就不起后面）
@@ -194,6 +242,12 @@ def main() -> int:
     missing = [s for s in ORDER if s not in counts]
 
     LOG.info(f"进程统计: {counts}")
+    if _denied[0]:
+        # 读不到 cmdline 的进程不计入 counts —— 声明出来，否则「缺失」可能是
+        # 权限而不是真死（r7-12）
+        LOG.warning(f"另有 {_denied[0]} 个进程 cmdline 读不到(AccessDenied)，"
+                    f"counts 可能偏低；下方 missing 判断需结合此数看")
+        print(f"\n[提示] {_denied[0]} 个进程 cmdline 读不到(权限)，计数可能偏低")
     if bad or missing:
         LOG.error(f"异常：缺={missing} 不足={bad}")
         print("\n[警告] 部分服务进程数不对：")
@@ -209,6 +263,22 @@ def main() -> int:
     print(f"\n[OK] {len(ORDER)} 个服务全部就绪，共 {total} 个进程（shim+真身）。")
     print(f"     隧道 health=200 | 日志目录: {HERE / 'logs'}")
     return 0
+
+
+def main() -> int:
+    """单例锁包装（r7-12）：拿不到锁直接退出；拿到后无论哪条 return 路径
+    （0/1/2/3）都在 finally 里释放，不会留下陈旧锁挡住下一次启动。"""
+    if not _acquire_lock():
+        LOG.error("另一份 start_services 正在运行，本次启动放弃（单例锁）")
+        print("\n[跳过] 已有一份 start_services 在运行，等它跑完再试。")
+        return 4
+    try:
+        return _main()
+    finally:
+        try:
+            LOCK.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

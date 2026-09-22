@@ -20,3 +20,4 @@ pc/triage_rules.json
 *.bak
 *.jsonl.1
 *.tmp
+pc/logs/

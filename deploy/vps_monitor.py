@@ -114,7 +114,23 @@ def _gray_write(line: str) -> None:
 
 
 def gray(kind, data):
-    """Gray-zone event: local spool + publish to fp-gray for the PC."""
+    """Gray-zone event: local spool + publish to fp-gray for the PC.
+
+    r7-11：整体必须吞异常 —— main 的 except 里正是调 gray("monitor-error")，
+    gray 自己再抛（磁盘满 -> mkdir/open 失败、publish 的 subprocess 超时）
+    会穿透 main -> 监控进程退出，而 PC 侧对 VPS 监控零覆盖，一崩全盲。
+    灰区通道宁可丢一条事件，也不能把主监控带走。
+    """
+    try:
+        _gray_impl(kind, data)
+    except Exception as e:
+        try:
+            print(f"gray({kind}) failed: {e!r}", flush=True)
+        except Exception:
+            pass
+
+
+def _gray_impl(kind, data):
     entry = {"ts": time.time(), "kind": kind, "data": data}
     line = json.dumps(entry, ensure_ascii=False)
     _gray_write(line)
@@ -206,8 +222,13 @@ def check_units():
 def main():
     load_state()
     last_check = time.time()
-    push("FuckPush VPS 监控已启动", "监控进程上线，硬规则生效", priority=2,
-         tags=["white_check_mark"])
+    try:
+        push("FuckPush VPS 监控已启动", "监控进程上线，硬规则生效", priority=2,
+             tags=["white_check_mark"])
+    except Exception as e:
+        # r7-11：启动 push 原来在 try 外 —— 磁盘满/STATE_FILE 只读一击退出，
+        # 监控循环根本进不去。
+        print(f"startup push failed: {e!r}", flush=True)
     while True:
         loop_start = time.time()
         try:
@@ -216,9 +237,14 @@ def main():
             check_ssh_login(last_check)
             check_units()
         except Exception as e:
-            gray("monitor-error", {"error": repr(e)})
+            gray("monitor-error", {"error": repr(e)})   # gray 自身不再抛 (r7-11)
         last_check = loop_start
-        save_state()
+        try:
+            save_state()
+        except Exception as e:
+            # r7-11：save_state(mkdir+write) 原来在 try 外，磁盘满一击退出；
+            # 落盘失败只是丢一次冷却状态（下次多推一条），不该带走监控。
+            print(f"save_state failed: {e!r}", flush=True)
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":

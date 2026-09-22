@@ -189,6 +189,45 @@ def read_tail(path, n: int = 60, max_bytes: int = 65536) -> list[str]:
         return []
 
 
+_rot_warn_at: dict[str, float] = {}
+
+
+def _rot_warn(path, err) -> None:
+    """轮转失败限频留痕（r7-5）：原来 except: pass 完全无日志，运维只看到
+    文件无限涨却查不到原因。写到独立小文件（不能用 logging —— 轮转失败的
+    很可能就是 logging 的 handler 出问题），每路径每小时最多一条。"""
+    key = str(path)
+    now = time.time()
+    if now - _rot_warn_at.get(key, 0) < 3600:
+        return
+    _rot_warn_at[key] = now
+    try:
+        p = Path(path).parent / "pclog_internal.log"
+        with p.open("a", encoding="utf-8") as f:
+            f.write(f"{now:.0f} rotate failed for {path}: {err!r}\n")
+        if p.stat().st_size > 256 * 1024:      # 自身也封顶
+            p.write_bytes(p.read_bytes()[-64 * 1024:])
+    except Exception:
+        pass
+
+
+def _trim_inplace(path, keep: int) -> None:
+    """不 rename 的截断：从倒数 keep 字节的第一个完整行起保留。
+    r+b 截断不要求文件独占，跨进程句柄挡住 rename 时这是唯一还能生效的
+    收缩手段（r7-5 硬上界）。"""
+    with Path(path).open("r+b") as f:
+        size = path.stat().st_size if False else f.seek(0, 2)
+        if size <= keep:
+            return
+        f.seek(size - keep)
+        f.readline()                    # 丢掉可能被截断的半行
+        pos = f.tell()
+        data = f.read()
+        f.seek(0)
+        f.write(data)
+        f.truncate()
+
+
 def append_rotating(path, text: str, *, max_bytes: int = 512 * 1024,
                     mode: str = "rotate") -> None:
     """追加一行；文件超过 max_bytes 时按 mode 收缩。
@@ -201,26 +240,46 @@ def append_rotating(path, text: str, *, max_bytes: int = 512 * 1024,
     原来全部零轮转，append-only 无限增长）。
     """
     path = Path(path)
-    if path.exists() and path.stat().st_size > max_bytes:
+    try:
+        # r7-5：exists+stat 一起进 try —— AV/权限让 stat 抛 OSError 时，
+        # 原实现异常冒到调用方，调用方 catch 后**这一行归档照样丢**
+        # （P2-6 声称要杜绝的形态只堵了一半）。
+        need = path.exists() and path.stat().st_size > max_bytes
+    except OSError as e:
+        need = False
+        _rot_warn(path, e)
+    if need:
         # 轮转是**尽力而为**，绝不因为轮转失败丢掉这一行归档（第 6 轮 P2-6）：
         # exists() 与 replace() 之间另一进程可能刚好也完成了轮转（TOCTOU），
-        # 这时 path.replace 抛 FileNotFoundError，原实现没接住 —— 异常冒到
-        # 调用方，这一行数据直接没了（ai_triager.log 里那条
-        # `archive write failed: FileNotFoundError` 就是它）。
-        # 轮转失败的最坏后果只是文件暂时超标，追加才是正事。
+        # 这时 path.replace 抛 FileNotFoundError。更常见的是 Windows 上另一
+        # 个进程持着同一日志的句柄（跨进程共享 RotatingFileHandler，r7-7），
+        # rename 必然 PermissionError。原实现第一次没接住、第二次 except pass
+        # 又**无痕**且无上限 —— .1 一直换不掉，文件无限涨到磁盘满。
+        rotated = False
         try:
             if mode == "tail":
                 data = path.read_bytes()[-(max_bytes // 2):]
                 nl = data.find(b"\n")
                 if nl != -1:
                     data = data[nl + 1:]
-                path.write_bytes(data)
+                tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+                tmp.write_bytes(data)
+                tmp.replace(path)      # r7-5：原子；失败不落半截/空文件
             else:
                 bak = path.with_name(path.name + ".1")
                 bak.unlink(missing_ok=True)
                 path.replace(bak)
-        except OSError:
-            pass
+            rotated = True
+        except OSError as e:
+            _rot_warn(path, e)
+        if not rotated:
+            # 就地截断兜底：rename 被跨进程句柄挡住时，r+b 截断不要求独占，
+            # 照样能把文件压回上限内 —— 增长有界（r7-5 的硬上界诉求），
+            # 代价是这次轮转丢了 .1 历史，可接受。
+            try:
+                _trim_inplace(path, max_bytes // 2)
+            except OSError as e2:
+                _rot_warn(path, e2)
     with path.open("a", encoding="utf-8") as f:
         f.write(text if text.endswith("\n") else text + "\n")
 
