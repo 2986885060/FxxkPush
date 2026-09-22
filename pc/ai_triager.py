@@ -74,7 +74,7 @@ def archive(rec):
 def load_state():
     if STATE.exists():
         try:
-            return json.loads(STATE.read_text())
+            return json.loads(STATE.read_text(encoding="utf-8"))
         except Exception as e:
             # 状态损坏（断电/非原子写时代留下的半截 JSON）。load_state 在
             # main() 的 while True 之外，这里抛出去就是服务死、没人接得住。
@@ -87,7 +87,7 @@ def save_state(st):
     # 原子写：先落 .tmp 再 rename。直接 write_text 写一半断电会留下半截
     # JSON —— 这个函数在每条消息的 finally 里跑，非原子写等于埋雷。
     tmp = STATE.with_name(STATE.name + ".tmp")
-    tmp.write_text(json.dumps(st, ensure_ascii=False))
+    tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
     tmp.replace(STATE)
 
 
