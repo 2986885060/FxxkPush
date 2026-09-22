@@ -202,16 +202,25 @@ def append_rotating(path, text: str, *, max_bytes: int = 512 * 1024,
     """
     path = Path(path)
     if path.exists() and path.stat().st_size > max_bytes:
-        if mode == "tail":
-            data = path.read_bytes()[-(max_bytes // 2):]
-            nl = data.find(b"\n")
-            if nl != -1:
-                data = data[nl + 1:]
-            path.write_bytes(data)
-        else:
-            bak = path.with_name(path.name + ".1")
-            bak.unlink(missing_ok=True)
-            path.replace(bak)
+        # 轮转是**尽力而为**，绝不因为轮转失败丢掉这一行归档（第 6 轮 P2-6）：
+        # exists() 与 replace() 之间另一进程可能刚好也完成了轮转（TOCTOU），
+        # 这时 path.replace 抛 FileNotFoundError，原实现没接住 —— 异常冒到
+        # 调用方，这一行数据直接没了（ai_triager.log 里那条
+        # `archive write failed: FileNotFoundError` 就是它）。
+        # 轮转失败的最坏后果只是文件暂时超标，追加才是正事。
+        try:
+            if mode == "tail":
+                data = path.read_bytes()[-(max_bytes // 2):]
+                nl = data.find(b"\n")
+                if nl != -1:
+                    data = data[nl + 1:]
+                path.write_bytes(data)
+            else:
+                bak = path.with_name(path.name + ".1")
+                bak.unlink(missing_ok=True)
+                path.replace(bak)
+        except OSError:
+            pass
     with path.open("a", encoding="utf-8") as f:
         f.write(text if text.endswith("\n") else text + "\n")
 

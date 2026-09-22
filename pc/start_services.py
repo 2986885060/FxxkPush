@@ -168,6 +168,15 @@ def main() -> int:
         print(f"\n[失败] 隧道 health 未通过（{HEALTH_TIMEOUT}s 内）：{detail}")
         print("后面的服务已按要求不起 —— 没有隧道，它们只会空转刷错。")
         print("排查: logs/ntfy_tunnel.log  |  vps.secret 是否正确 / SSH 端口是否通")
+        # P2-2：健康门失败也必须把 watchdog 起起来。原来 return 2 发生在
+        # start(ORDER[1:]) 之前，于是**这次重启之后整机零告警能力** ——
+        # 控制台还能看见（人工跑的时候），一旦挂成计划任务/静默重启就是
+        # 纯盲区。watchdog 起来后会按 health/procs 判定报警（隧道通不了，
+        # 它会走 SSH / 本机 toast 这两条不依赖隧道的通道）。
+        try:
+            start("watchdog.py")
+        except Exception as e:
+            LOG.error(f"失败路径下起 watchdog 也失败了: {e!r}")
         return 2
     LOG.info(f"隧道 health=200（{detail}）")
     time.sleep(POST_HEALTH_DELAY)
