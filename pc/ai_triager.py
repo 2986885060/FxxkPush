@@ -20,6 +20,9 @@ from pathlib import Path
 
 import httpx
 
+import pclog
+import fp_feedback
+
 HERE = Path(__file__).parent
 CONFIG = json.loads((HERE / "triage_config.json").read_text(encoding="utf-8"))
 
@@ -30,6 +33,9 @@ ARCHIVE = HERE / "triage_log.jsonl"
 STATE = HERE / "triage_state.json"
 
 TOPICS_IN = {"fp-pc": "通知", "fp-gray": "VPS灰区", "fp-vps": "VPS硬规则"}
+# 反馈 topic 不进 TOPICS_IN：那个 dict 的 value 是给 AI 的 kind 标签，
+# 反馈要是混进去就会被当成 [fp-feedback] 待分诊消息问一遍模型。
+ALL_TOPICS = [*TOPICS_IN, fp_feedback.TOPIC]
 TOPIC_OUT = "fp-phone"
 
 SYSTEM_PROMPT = """你是消息分诊助手。用户会在手机上收到你判定为"重要"的消息，\
@@ -43,8 +49,11 @@ SYSTEM_PROMPT = """你是消息分诊助手。用户会在手机上收到你判�
 只输出 JSON，格式：{"label": "重要"|"忽略", "reason": "10字以内理由"}"""
 
 
-import pclog
 LOG = pclog.get_logger("ai_triager")
+
+# 推送快照的存活期。超过一周的👍/👎已经没有纠正意义，占着 state 只会让
+# 每次 save_state 都多写一堆死数据 —— 反馈是低频事件，7 天足够。
+PUSH_TTL = 7 * 24 * 3600
 
 
 def log(msg):
@@ -71,16 +80,41 @@ def archive(rec):
         log(f"archive write failed: {e!r}")
 
 
+def _prune_pushes(st: dict) -> None:
+    """丢掉过期的推送快照。启动时和每次入队后各跑一次 —— 环形缓冲的最小
+    实现，不用后台定时器（多一个任务就多一个可能挂在 finally 外的异常）。"""
+    pushes = st.get("pushes")
+    if not isinstance(pushes, dict) or not pushes:
+        st["pushes"] = {}
+        return
+    now = time.time()
+    st["pushes"] = {k: v for k, v in pushes.items()
+                    if isinstance(v, dict) and now - v.get("ts", 0) < PUSH_TTL}
+
+
 def load_state():
+    st = None
     if STATE.exists():
         try:
-            return json.loads(STATE.read_text(encoding="utf-8"))
+            st = json.loads(STATE.read_text(encoding="utf-8"))
         except Exception as e:
             # 状态损坏（断电/非原子写时代留下的半截 JSON）。load_state 在
             # main() 的 while True 之外，这里抛出去就是服务死、没人接得住。
             # 丢去重状态的最坏后果只是同一条消息重新分诊一次，比死强。
             log(f"triage state corrupt ({e!r}), resetting")
-    return {"recent": {}, "last_report": ""}
+    if not isinstance(st, dict):
+        st = {"recent": {}, "last_report": ""}
+    if not isinstance(st.get("recent"), dict):
+        # 「可解析但形状不对」：recent 要是字符串/列表，setdefault 只补键不
+        # 校验类型，dedup_check 的 .items() 会让除硬规则外的每条消息都抛，
+        # 被 consume 吞掉 —— 服务看着活着，AI 路径其实全废。
+        st["recent"] = {}
+    if not isinstance(st.get("pushes"), dict):
+        st["pushes"] = {}
+    if not isinstance(st.get("last_report"), str):
+        st["last_report"] = ""
+    _prune_pushes(st)
+    return st
 
 
 def save_state(st):
@@ -129,15 +163,19 @@ def dedup_check(st, kind, content) -> str | None:
     return "pass"
 
 
-async def push_phone(client, title, message, priority=4):
+async def push_phone(client, title, message, priority=4, actions=None):
     try:
-        r = await client.post(NTFY_BASE + "/", timeout=10, json={
+        payload = {
             "topic": TOPIC_OUT, "title": title, "message": message,
             "priority": priority,
             # tags carries the trace_id: ntfy drops every other custom field,
             # so this is the only channel that can carry the chain to the phone.
             "tags": pclog.tags_with_trace(["bell"]),
-        }, headers={"Authorization": f"Bearer {NTFY_TOKEN}"})
+        }
+        if actions:
+            payload["actions"] = actions
+        r = await client.post(NTFY_BASE + "/", timeout=10, json=payload,
+                              headers={"Authorization": f"Bearer {NTFY_TOKEN}"})
         return r.status_code == 200
     except Exception as e:
         # 传输失败要在这里变成 False：冒出去会把整条 SSE 断掉（见 consume），
@@ -186,6 +224,19 @@ async def handle_event(client, st, topic, ev):
                  "content": content, "label": "重复抑制"})
         return
 
+    # 源级规则快速路：这个源被人工点过 3 次👎 → 直接静默归档，连 AI 都不问
+    # （省一次 API 调用）。排在两条硬规则之后：@提及和测试通道是用户明确要
+    # 的东西，不该被一条自动学来的规则压掉。
+    # 只对 fp-pc 生效：其它 topic 的 src 恒等于 topic 名（见上面的 else 分支），
+    # 对 fp-vps 点 3 次👎 会静音掉整条服务器告警通道 —— 磁盘爆了手机不响，
+    # 这个口子绝不能开。按钮侧也做了同样的限定（push 段），这里是第二道闸。
+    if topic == "fp-pc" and fp_feedback.should_ignore(src):
+        archive({"ts": time.time(), "topic": topic, "src": src,
+                 "content": content, "label": "规则静默",
+                 "reason": f"源[{src}]误判累积"})
+        log(f"rule-silenced [{src}] {content[:50]}")
+        return
+
     try:
         verdict = await classify(client, kind, content)
     except Exception as e:
@@ -206,10 +257,52 @@ async def handle_event(client, st, topic, ev):
                     re.sub(r"\s+", "", content)[:40] in k), None)
         cnt = st["recent"].get(key, {}).get("count", 1) if key else 1
         suffix = f"（第{cnt}次）" if cnt > 1 else ""
-        ok = await push_phone(client, f"{src}{suffix}", f"{content[:200]}\n— {reason}")
-        log(f"{'PUSHED' if ok else 'PUSH_FAIL'} [{src}] {reason} | {content[:50]}")
+        # 推送快照：反馈回来时靠它还原 src/content。triage_log 是轮转的，
+        # 几天后点一次按钮去那里查只会读到空 —— 所以自包含地存一份。
+        # 只有 fp-pc 才带按钮：其它 topic 的 src 就是 topic 名本身，规则粒度
+        # 是「整条通道」，3 次👎 会把 VPS 告警整条静音（不可接受）。
+        pid = pclog.new_trace_id()
+        actions = fp_feedback.build_actions(pid) if topic == "fp-pc" else None
+        if actions:
+            # 没有 actions 就不会有反馈，快照存着只会在 state 里躺满 7 天。
+            # content 截到 500：够做微调语料，又不至于让 save_state 每条消息
+            # 都重写几万字节（推送本身也只发前 200 字）。
+            st["pushes"][pid] = {
+                "ts": time.time(), "topic": topic, "src": src,
+                "content": content[:500], "label": label, "reason": reason,
+            }
+            _prune_pushes(st)
+        ok = await push_phone(client, f"{src}{suffix}",
+                              f"{content[:200]}\n— {reason}", actions=actions)
+        if not ok and actions:
+            # 没推出去 = 手机上不会出现按钮 = 这个 pid 永远等不到反馈，
+            # 留着只是白占 7 天 state
+            st["pushes"].pop(pid, None)
+        log(f"{'PUSHED' if ok else 'PUSH_FAIL'} [{src}] {reason} "
+            f"push_id={pid} {'+fb' if actions else ''} | {content[:50]}")
     else:
         log(f"silent    [{src}] {reason} | {content[:50]}")
+
+
+def _unwrap(ev: dict, body: str) -> dict:
+    """把裹在 message 字符串里的负载还原成 dict。
+
+    fp-pc 是 JSON、fp-gray 是 JSON、fp-vps 是纯文本，三种形状在这里统一成
+    {"title": ..., ...}。解析失败一律退回 {"title", "message"} 兜底，绝不抛。
+
+    顺带修掉一个边界：body 是合法 JSON 但不是对象（`null` / `123` / `"x"`）时，
+    原实现在 isinstance 检查失败后会让 parsed 保持 None，一路传到
+    handle_event 的 ev.get("title") 上炸 AttributeError。
+    """
+    try:
+        maybe = json.loads(body)
+    except json.JSONDecodeError:
+        maybe = None
+    if isinstance(maybe, dict):
+        parsed = maybe.get("data", maybe)
+        if not isinstance(parsed, str):
+            return {"title": ev.get("title", ""), **parsed}
+    return {"title": ev.get("title", ""), "message": body}
 
 
 async def consume(client, st, topic):
@@ -238,28 +331,48 @@ async def consume(client, st, topic):
                 # fp-pc arrives as JSON string inside message (from listener);
                 # fp-gray is our gray JSON; fp-vps is plain text
                 body = ev.get("message", "")
-                parsed = None
-                try:
-                    maybe = json.loads(body)
-                    if isinstance(maybe, dict):
-                        parsed = maybe.get("data", maybe)
-                        if isinstance(parsed, str):
-                            parsed = {"title": ev.get("title", ""), "message": body}
-                        else:
-                            parsed = {"title": ev.get("title", ""), **parsed}
-                except json.JSONDecodeError:
-                    parsed = {"title": ev.get("title", ""), "message": body}
                 # 结构性兜底：单条消息失败绝不能断开 SSE —— 重连不回放，
                 # 断开的这几秒里该 topic 的消息会永久丢失。classify/push_phone
                 # 各自有 try，这里防的是 archive、未来的调用、以及任何没想到的
                 # 异常。save_state 放 finally：失败那条也得把去重状态存下去，
                 # 否则同一条消息重连后会再分诊一次。
                 try:
-                    await handle_event(client, st, topic, parsed)
+                    if topic == fp_feedback.TOPIC:
+                        # 反馈分支不走 _unwrap：那层解析会把 {"verdict": ...}
+                        # 摊平、丢掉 message 键，handle 再 json.loads 一次就是
+                        # 白做功 + 拿不到东西（两边注释都记了这个坑）。
+                        fp_feedback.handle(st, body)
+                    else:
+                        await handle_event(client, st, topic, _unwrap(ev, body))
                 except Exception as e:
-                    log(f"handle_event failed ({e!r}), stream stays up")
+                    log(f"handle failed ({e!r}), stream stays up")
                 finally:
                     save_state(st)
+
+
+async def supervise(client, st, topic, max_fails: int = 12):
+    """单条流的监督者：这条流挂了只重连它自己。
+
+    原来是 ``gather(*(consume(...)))``，而 asyncio.gather 默认**第一个异常
+    就向上传播并 cancel 其余任务**。fp-feedback 是全新链路（发布端实测过
+    不等于订阅端没问题），它一旦 401/404，另外三条主流会被一个自己用不到
+    的 topic 每 5 秒拖断一次 —— 而重连不回放，断开那几秒的消息永久丢失。
+
+    连续失败攒到 max_fails（12 × 5s = 1 分钟）就往外抛，让 main 重建
+    httpx client：client 级的故障（系统代理毒化那种）在流内小打小闹治不好，
+    必须换掉整个客户端 —— 原 main 的重连逻辑正是为此存在，不能丢。
+    """
+    fails = 0
+    while True:
+        try:
+            await consume(client, st, topic)
+            fails = 0  # 服务端主动断开也算一次干净收尾
+        except Exception as e:
+            fails += 1
+            log(f"[{topic}] stream error: {e!r} #{fails}, reconnect in 5s")
+            if fails >= max_fails:
+                raise
+        await asyncio.sleep(5)   # 正常收尾也要等：否则服务端秒断会变成紧循环
 
 
 async def main():
@@ -275,12 +388,12 @@ async def main():
         # loopback tunnel and to the API directly, so never use a proxy.
         try:
             async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-                # one task per input topic
+                # 每条流在 supervise 里自己重连；这一层只处理 client 级故障
                 await asyncio.gather(
-                    *(consume(client, st, t) for t in TOPICS_IN)
+                    *(supervise(client, st, t) for t in ALL_TOPICS)
                 )
         except Exception as e:
-            log(f"stream error: {e!r}, reconnect in 5s")
+            log(f"client error: {e!r}, rebuilding client in 5s")
             await asyncio.sleep(5)
 
 

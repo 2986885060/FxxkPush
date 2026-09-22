@@ -26,6 +26,9 @@ Windows toast 通知（QQ/钉钉/学习通等）    │     ├─ 重要 → nt
      （窗口藏屏外 + 定时截图 → MiMo 视觉分诊）
 
 PC 侧所有服务 → http://127.0.0.1:2586 → (pc/ntfy_tunnel.py 走 SSH) → VPS ntfy:2586
+                                                        ↑
+手机上点 👍/👎 按钮 ── ntfy http action ──→ VPS /fp-feedback ┘
+                                       （pc/fp_feedback.py 消费 → 规则自动纠正）
 ```
 
 - **VPS（1C1G）**：传感器 + 中继。ntfy 常驻（推送通道永远在线），日志硬规则判级（grep 级零内存），不跑 AI
@@ -206,7 +209,8 @@ curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0
 | `pc/notification_listener.py` | PC (自启) | UserNotificationListener 抓 toast → fp-pc + JSONL 归档 |
 | `pc/wechat_vision_listener.py` | PC (自启) | 微信/企业微信窗口藏屏外 → 定时截图 → MiMo 视觉分诊 |
 | `pc/pc_subscriber.py` | PC (自启) | 订阅 fp-vps/fp-gray，弹 Windows toast |
-| `pc/ai_triager.py` | PC (自启) | 消费 fp-pc/fp-gray/fp-vps → AI 分诊 → fp-phone / 静默 |
+| `pc/ai_triager.py` | PC (自启) | 消费 fp-pc/fp-gray/fp-vps/fp-feedback → AI 分诊 → fp-phone / 静默，反馈经 `fp_feedback` 改写规则 |
+| `pc/fp_feedback.py` | PC (由 ai_triager 调用) | 误判反馈闭环：👍/👎 按钮构造、反馈落盘（自带 content 快照 = 微调语料）、源级规则状态机（3 次👎→静默跳过 AI，👍 可撤销） |
 | `pc/park_windows.py` + `拖走聊天窗口.bat` | PC | 一键把微信/企业微信窗口挪到屏幕外（重启后手动归位用） |
 | `pc/probe_notifications.py` | PC | 通知权限探测/诊断工具 |
 | `pc/pclog.py` | PC | 统一日志：单一格式（ISO 带日期 + level + 服务名 + trace_id）、单一出口（`pc/logs` + stderr）、RotatingFile 2MB×3、自动分级 |
@@ -233,6 +237,9 @@ curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0
 - 语音/图片类通知：图片通知走视觉模型可判，语音只能看到"发来一条语音"而不知内容
 - **httpx 默认 `trust_env=True` 会读 Windows 系统代理**（v2rayN 的 `127.0.0.1:12334`）：长寿命客户端在代理关掉后会永久抱死该端口，所有请求 `WinError 10061` 直到进程重启。本项目所有 httpx 客户端一律 `trust_env=False`，且重连时**重建客户端不复用**
 - **ntfy 只透传已知字段**：自定义 header（`X-Fp-Trace`）和未知 JSON 字段（`trace_id`/`sequence_id`）都会被服务端静默丢弃（HTTP 200 但订阅端收不到），只有 `tags` 完整回传 —— 所以 trace_id 寄生在 `tags` 里（`t_<8位hex>`）
+- **ntfy 会丢掉 action 的 `body_type`**（实测发出什么收不到什么），手机端最终用哪种 `Content-Type` 因此不可知。解法：action 的 `url` 直接带 topic（`…/fp-feedback`），body 放纯 JSON —— 实测 `application/json` 和 `text/plain` 两种发法都 200、`message` 都是原样 JSON
+- **反馈消息的 `title` 和 `tags` 实测均为 `None`**：任何靠 title/tags 反查原推送的匹配都会静默失配，所以 `push_id` 只能寄生在 `message` body 里，推送时的快照存 `triage_state.json` 的 `pushes`（7 天 TTL）
+- **`ai_triager.consume` 会把 message 里的 JSON 摊平成 dict 自身**（`verdict` 上浮、`message` 键消失），反馈分流必须传**原始 body** 而不是解析后的 `parsed`，否则读 `ev["message"]` 拿到 `None`
 - ReviOS 精简版需验证通知中心可用（本项目环境已验证）
 
 ## Roadmap
@@ -242,8 +249,10 @@ curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0
 - [x] v0.2.1：SSH 隧道抗端口封锁、通知回流修复、服务文件日志与崩溃留痕、DPI 修正、窗口一键归位
 - [x] v0.2.2：@提及硬规则下沉到手机闸门（修复被 AI 覆盖导致 @所有人 不推）、同一未读消息 6 小时内只报一次
 - [x] v0.3.0：统一日志 `pc/pclog.py`（格式/出口/level/trace_id 贯穿全链路）、启动健康门（`health=200` 才起服务）、管道自检看门狗（故障绕过 AI 直推手机，SSH 独立告警通道）、httpx 系统代理毒化修复（`trust_env=False`）
+- [x] v0.4.0：误判反馈闭环（`pc/fp_feedback.py`）—— 手机端 👍/👎 按钮 → `fp-feedback` → 反馈归档含内容快照 → 源级规则自动纠正（3 次误判自动静默并跳过 AI，👍 可撤销），闭合「推送 → 人肉判定 → 规则纠正 → 少推」这一环
 - [ ] 钉钉 / 学习通等更多 App 深度适配
-- [ ] 每日日报（AI 汇总当天事件/误判，22:00 推手机）
-- [ ] 误判样本积累 → 未来 27B 模型微调
+- [ ] 每日日报（AI 汇总当天事件/误判，22:00 推手机；`fp_feedback.stats()` 已备好误判统计）
+- [ ] 误判样本 → 27B 模型微调（语料已在 `pc/feedback.jsonl` 自包含落地，缺训练流程）
+- [ ] 反馈的「该推没推」信号（当前只有👎 能点，被静默的消息手机上没有按钮）
 - [ ] WebSocket 订阅 + PWA 界面
 - [ ] Go 重写（性能瓶颈出现后）
