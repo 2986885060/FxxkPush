@@ -423,6 +423,30 @@ async def handle_event(client, st, topic, ev):
         log(f"TEST_PUSH {'ok' if ok else 'FAIL'} [{src}] {content[:50]}")
         return
 
+    # P2-6: fp-vps 是硬规则通道 —— vps_monitor 的 docstring 承诺「直接推
+    # 手机」，实际却进这里被 AI 二道闸（实测启动 push 被判「忽略」静默归档，
+    # PC 端 toast 还在、手机全聋）。整通道绕过 AI+dedup，fail-open：多推
+    # 无害，漏推致命。不按 priority 分流有两重原因：_unwrap 只透传
+    # title/message（SSE 原始事件的 priority 已被丢弃，实测 L536/547），
+    # 以及 priority=3 的 SSH 登录同样是硬规则、分流会漏它。VPS 侧 cooldown
+    # （disk/unit 30min、ssh 24h）才是这里唯一的去重权威。
+    if topic == "fp-vps":
+        archive({"ts": time.time(), "topic": topic, "src": src,
+                 "content": content, "label": "重要",
+                 "reason": "VPS硬规则直推(绕过AI二道闸)"})
+        msg = f"{content[:200]}\n— VPS 硬规则，绕过 AI 直推"
+        ok = await push_phone(client, f"[VPS] {title or '硬规则'}", msg)
+        if not ok:
+            if len(_push_pending) >= PENDING_CAP:
+                dropped = _push_pending.pop(0)
+                if dropped.get("pid"):
+                    st["pushes"].pop(dropped["pid"], None)
+            _push_pending.append({"title": f"[VPS] {title or 'fp-vps'}",
+                                  "message": msg, "actions": None,
+                                  "pid": None, "ts": time.time()})
+        log(f"HARD_PUSH {'ok' if ok else 'FAIL->pending'} [{src}] {content[:50]}")
+        return
+
     # dedup first (no API call for repeats)
     if dedup_check(st, kind, content) is None:
         log(f"dedup suppressed [{src}] {content[:40]}")
