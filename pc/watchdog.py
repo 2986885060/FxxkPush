@@ -86,7 +86,39 @@ LOG_STEM = {
 }
 LINK_LOGS = [LOG_STEM[s] for s in WATCHED]   # check_link 要扫的全部日志
 
+# P2-1：告警标题/影响/排查按检查项枚举 —— 原来标题是英文内部名、影响只有
+# 二分法（health/其它）、排查恒为通配 pc/logs/*.log，收到告警的人不知道
+# 该开哪个文件。detail 里点得出服务名的（quiet/link/procs）直接给精确路径。
+CHECK_CN = {"health": "服务健康", "procs": "服务进程", "link": "链路报错",
+            "disk": "磁盘空间", "quiet": "日志静默", "vps": "VPS监控"}
+CHECK_IMPACT = {
+    "health": "全链路推送中断（ntfy 隧道不通，PC↔手机所有推送断开）",
+    "procs": "对应服务未运行，它负责的功能停摆",
+    "link": "服务活着但持续报错，对应功能半残",
+    "disk": "磁盘不足：日志轮转/状态归档会失败，可观测性先死",
+    "quiet": "进程在但日志心跳断了，可能已卡死或空转",
+    "vps": "VPS 侧监控链路不可达，服务器告警收不到",
+}
+CHECK_DEBUG = {
+    "health": "curl health 端点 + pc/logs/ntfy_tunnel.log",
+    "disk": "清理磁盘；检查 pc/logs/*.log 轮转是否失效",
+    "vps": "VPS 上: journalctl -u fuckpush-monitor -n 50 --no-pager",
+    "link": "pc/logs/<出错服务>.log（详情已附最近一条错误原文）",
+    "quiet": "详情点名的服务对应的 pc/logs/<stem>.log",
+    "procs": "详情点名的服务对应的 pc/logs/<stem>.log；pc/start_services.py",
+}
+
+
+def _debug_hint(name: str, detail: str) -> str:
+    """P2-1：detail 里点到的服务名 -> 精确日志路径；点不到用固定排查位。"""
+    hits = sorted({s for s in LINK_LOGS if s in detail})
+    if hits:
+        return "、".join(f"pc/logs/{s}.log" for s in hits)
+    return CHECK_DEBUG.get(name, "pc/logs/watchdog.log")
+
+
 import pclog
+from alert_fallback import push_vps, push_toast   # P2-5：2/3 层与 listener 共用
 LOG = pclog.get_logger("watchdog")
 
 
@@ -287,6 +319,7 @@ def check_link() -> tuple[bool, str]:
             continue
         errs = oks = 0
         err_secs: set[int] = set()
+        last_err = None            # P2-1：窗口内最近一条错误原文，告警里附带
         for ln in lines:
             ts = _log_ts(ln)
             if ts is None or now - ts > LINK_ERR_MIN:
@@ -295,14 +328,18 @@ def check_link() -> tuple[bool, str]:
                 # r7-2：一次异常的多行 traceback 逐行计入的话，单次异常就
                 # 瞬间满足 errs>=3。同一秒的多行 = 同一次异常，算 1 条。
                 err_secs.add(int(ts))
+                last_err = ln      # P2-1：拿到实证，不用再让人对着 stem 猜
             elif "[INFO" in ln:
                 # r7-2：[WARN] 不算「正常」—— 慢速重试刷 WARN 时 oks 被灌大，
                 # errs<oks 恒绿，真正的错误被压住。
                 oks += 1
         errs = len(err_secs)
         if errs >= LINK_ERR_THRESHOLD and (oks == 0 or errs >= oks):
-            suspects.append(f"{stem}: {errs} 条错误/{oks} 条正常"
-                            f"（近 {LINK_ERR_MIN//60}min）")
+            seg = (f"{stem}: {errs} 条错误/{oks} 条正常"
+                   f"（近 {LINK_ERR_MIN//60}min）")
+            if last_err:
+                seg += f"｜最近错误: {last_err.strip()[:120]}"
+            suspects.append(seg)
     if suspects:
         return False, "link " + "; ".join(suspects)
     return True, "link 正常"
@@ -516,148 +553,6 @@ def push_local(payload: dict) -> bool:
         return False
 
 
-def push_vps(payload: dict) -> bool:
-    """SSH 到 VPS，在它本机发 ntfy —— 隧道死了这条路还活着。
-
-    payload 走 base64：JSON 里有中文和引号，塞进 shell 命令会被转义啃掉，
-    base64 全 ASCII 就没这问题；VPS 端用 curl -d @file 读，零转义。
-    """
-    # r8 P1-2：secret 解包 / import paramiko / SSHClient 构造原来在 try
-    # **之外** —— vps.secret 被改坏（字段数≠4 抛 ValueError）、AV 瞬间拒读
-    # （OSError）、paramiko 导入失败，且同时本地隧道不可用（正是要走第二层
-    # 的时刻）时，异常沿 push_vps → send_alert → main 冒出，excepthook 再
-    # 调 send_alert 撞同一异常被 except 吞掉，**第三层 toast 根本没机会
-    # 执行** → watchdog os._exit，监控整体停摆 —— 复刻 17:21「最该报警时
-    # 一条都没送出去」。全部收进 try。
-    cli = None
-    try:
-        secret = HERE.parent / "vps.secret"
-        if not secret.exists():
-            LOG.error("vps.secret 不存在，无法走 SSH 兜底")
-            return False
-        host, port, user, pwd = secret.read_text().split()
-        import paramiko
-
-        cli = paramiko.SSHClient()
-        cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        cli.connect(host, port=int(port), username=user, password=pwd,
-                    timeout=15, banner_timeout=20, auth_timeout=20)
-        b64 = base64.b64encode(
-            json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode()
-        # curl 走 shell 命令行，两个约束：整条命令的单引号必须是偶数
-        # （否则 shell 报未闭合、$() 拿到空串、push_vps 恒返回 False），
-        # 以及 token 只在取得到时才带 header。token 出现在命令行只在自己的
-        # VPS 上短暂可见（ps aux），可接受。
-        tok = _token()
-        auth = f"-H 'Authorization: Bearer {tok}' " if tok else ""
-        cmd = (
-            "set -e; "
-            f"echo {b64} | base64 -d > /tmp/fp_watchdog_alert.json; "
-            f"code=$(curl -s -o /dev/null -w '%{{http_code}}' "
-            f"{auth}"
-            "-H 'Content-Type: application/json' "
-            "-d @/tmp/fp_watchdog_alert.json "
-            "http://127.0.0.1:2586/); "
-            "rm -f /tmp/fp_watchdog_alert.json; "
-            "echo $code"
-        )
-        _, stdout, stderr = cli.exec_command(cmd, timeout=25)
-        out = stdout.read().decode("utf-8", "replace").strip()
-        err = stderr.read().decode("utf-8", "replace").strip()
-        if out == "200":
-            return True
-        LOG.error(f"vps alert rejected: code={out!r} stderr={err[:200]!r}")
-        return False
-    except Exception as e:
-        LOG.error(f"vps alert channel failed: {e!r}")
-        return False
-    finally:
-        if cli is not None:      # r8 P1-2：构造阶段就异常时 cli 还是 None
-            try:
-                cli.close()
-            except Exception:
-                pass
-
-
-def _record_echo(title: str, message: str) -> None:
-    """把弹出去的 toast 记进 toast_echo.jsonl，让 notification_listener 认出
-    这是自己人（P2-9）。
-
-    不记的话，watchdog 自己弹的告警 toast 会被 listener 当成新通知重新入队
-    分诊 —— 实测 18:17/18:18 有两条 ``PUSH [?] FxxkPush watchdog 通道测试``；
-    断网期间还会变成每 30 分钟一条必失败的 PUSH_FAIL，恢复后再补推一条过期
-    的「已恢复」。
-
-    r7-7：**不能** import pc_subscriber 来复用它的 record_echo —— 模块导入
-    会执行 get_logger("pc_subscriber")，watchdog 进程从此长期持有
-    pc_subscriber.log（347KB，最吵的那个）的 RotatingFileHandler；Windows 下
-    rename 需要另一进程先关闭句柄，谁先轮转谁 PermissionError，被
-    logging.handleError 静默吞掉 —— 该日志的 2MBx3 上限实际失效、无限增长。
-    这里按同一格式（同一文件、同一字段）直接写，不再连带 import。
-    """
-    try:
-        pclog.append_rotating(
-            HERE / "toast_echo.jsonl",
-            json.dumps({"ts": time.time(), "title": (title or "").strip(),
-                        "msg": (message or "").strip()}, ensure_ascii=False),
-            max_bytes=256 * 1024, mode="tail")
-    except Exception as e:
-        LOG.warning(f"record echo failed (listener may re-triage this toast): {e!r}")
-
-
-def push_toast(title: str, message: str) -> bool:
-    """Windows 原生 toast —— 零网络依赖，两条网络通道同时挂时的最后防线。
-
-    2026-09-22 17:21-17:28 实测过这个缺口：ntfy 隧道 WinError 10061 和
-    VPS SSH TimeoutError **同时**发生（前两条通道共享「外部网络」这一个
-    故障域），watchdog 连打两条「告警两条通道都失败！」—— 最该报警的
-    时刻一条都没送出去，等恢复了才把「已恢复」发出来。这条通道只碰本机
-    通知中心：断网、隧道死、SSH 死都照样弹。
-
-    AUMID 用 ``"Windows PowerShell"``（powershell.exe 在通知中心的注册名，
-    Win10/11 内置，零第三方依赖）—— 实测 CreateToastNotifier 对它不抛，
-    stdout 收到 SHOWN、returncode 0。中文经环境变量传，绕开命令行转义。
-    """
-    ps = (
-        "$ErrorActionPreference='Stop'; "
-        "[void][Windows.UI.Notifications.ToastNotificationManager,"
-        "Windows.UI.Notifications,ContentType=WindowsRuntime]; "
-        "$x=[Windows.UI.Notifications.ToastNotificationManager]::"
-        "GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]"
-        "::ToastText02); "
-        "$t=$x.GetElementsByTagName('text'); "
-        "$t.Item(0).AppendChild($x.CreateTextNode($env:FP_T))|Out-Null; "
-        "$t.Item(1).AppendChild($x.CreateTextNode($env:FP_M))|Out-Null; "
-        "$n=[Windows.UI.Notifications.ToastNotificationManager]::"
-        "CreateToastNotifier('Windows PowerShell'); "
-        "$n.Show([Windows.UI.Notifications.ToastNotification]::new($x)); "
-        "Write-Output 'SHOWN'"
-    )
-    env = {**os.environ, "FP_T": _cut(title, 120), "FP_M": _cut(message, 900)}
-    try:
-        # 同步等退出码：Popen 不等待的话，「弹失败了」和「弹成功」在日志里
-        # 长得一模一样，等于这条通道没有可观测性。
-        p = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive",
-             "-WindowStyle", "Hidden", "-Command", ps],
-            capture_output=True, text=True, timeout=20, env=env,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        out = (p.stdout or "").strip()
-        if p.returncode == 0 and "SHOWN" in out:
-            _record_echo(title, message)   # 别让 listener 把这条告警再推一遍
-            # r8 P1-3②：SHOWN 只证明 PowerShell 把通知**提交**给了通知中心，
-            # 不证明用户看见 —— 勿扰/专注模式会静默吞掉它。日志措辞降级，
-            # 免得事后拿「已送达」当「已看到」的证据。
-            LOG.info("toast 已提交给通知中心（未证实显示；勿扰/专注模式会静默吞掉）")
-            return True
-        LOG.error(f"toast channel failed: rc={p.returncode} "
-                  f"stderr={(p.stderr or '').strip()[:300]!r}")
-        return False
-    except Exception as e:
-        LOG.error(f"toast channel failed: {e!r}")
-        return False
-
-
 def send_alert(title: str, message: str) -> bool:
     """降级链：本地隧道（秒回）→ VPS SSH → 本机 toast（零网络）。
 
@@ -681,13 +576,13 @@ def send_alert(title: str, message: str) -> bool:
         except Exception as e:
             LOG.error(f"local alert channel raised: {e!r}")
         try:
-            if push_vps(payload):
+            if push_vps(payload, LOG):
                 LOG.info(f"告警已送达(VPS-SSH兜底) {title}")
                 return True
         except Exception as e:
             LOG.error(f"vps alert channel raised: {e!r}")
     try:
-        if push_toast(title, message):
+        if push_toast(title, message, LOG):
             LOG.info(f"告警已送达(本机toast，两条网络通道都失败) {title}")
             return True
     except Exception as e:
@@ -719,11 +614,11 @@ def send_canary() -> bool:
         if push_local(payload):
             LOG.info("canary 已送达(本地隧道)")
             return True
-        if push_vps(payload):
+        if push_vps(payload, LOG):
             LOG.info("canary 已送达(VPS-SSH兜底)")
             return True
         if push_toast(CANARY_TITLE,
-                      "canary：两条网络通道都失败（本机 toast 兜底）"):
+                      "canary：两条网络通道都失败（本机 toast 兜底）", LOG):
             LOG.warning("canary 仅本机 toast（网络通道全失败，本身即故障信号）")
             return True
         LOG.error("canary 三条通道都失败")
@@ -743,6 +638,8 @@ def main() -> int:
     LOG.info(f"watchdog up: interval={CHECK_INTERVAL}s fail_threshold={FAIL_MIN}min")
     fault_since: dict[str, float] = {}
     last_alert: dict[str, float] = {}   # name -> 上次告警时间
+    last_any_alert = 0.0                # P2-2 全局键：任何一条告警的发送时间
+    recover_pending: dict[str, tuple[str, float, str]] = {}  # P2-2 发失败的恢复通知
     cycle = 0
 
     last_revive: dict[str, float] = {}   # svc -> 上次自动拉起时间
@@ -763,6 +660,8 @@ def main() -> int:
                 LOG.error("canary 发送失败，60s 后重试")
         healthy_now = 0
         health_ok = False
+        red_batch: list[tuple[str, str, float, float]] = []  # name, detail, dur, start
+        rec_batch: list[tuple[str, float, str]] = []         # name, dur, detail
         for name, fn in CHECKS:
             try:
                 ok, detail = fn()
@@ -782,14 +681,11 @@ def main() -> int:
                         LOG.info(f"{name} 恢复（故障持续 {fmt_dur(dur)}）")
                         if name in last_alert:
                             # 告警过就告知恢复，否则静默（没打扰过就别吵）。
-                            # r7-13：原来忽略 send_alert 返回值、无条件 pop ——
-                            # 三条通道全失败时（17:21 形态）「已恢复」永久丢失，
-                            # 用户只看到故障没看到恢复。失败就留着，下一轮重试。
-                            if send_alert(f"[FxxkPush] {name} 已恢复",
-                                          f"故障持续 {fmt_dur(dur)} 后恢复正常。\n{detail}"):
-                                last_alert.pop(name, None)
-                            else:
-                                LOG.error(f"恢复通知发送失败，下一轮重试: {name}")
+                            # P2-2：攒进 rec_batch 同轮合并发送；发送失败真进
+                            # recover_pending 下一轮重试 —— 原实现 pop 了
+                            # fault_since 后「下一轮重试」根本回不来（r7-13
+                            # 留的 last_alert 只在再出新故障时才起作用）。
+                            rec_batch.append((name, dur, detail))
                     except Exception as e:
                         LOG.error(f"恢复通知段异常(已隔离): {name} {e!r}")
                 continue
@@ -800,32 +696,75 @@ def main() -> int:
             if dur < FAIL_MIN * 60:
                 LOG.warning(f"{name} 不健康 {fmt_dur(dur)}（阈值 {FAIL_MIN}min）: {detail}")
                 continue
+            # 超阈值：先攒批发批处理段（P2-2），双键决定发不发
+            red_batch.append((name, detail, dur, start))
 
-            # 超过阈值：告警（同一故障最多每 RENOTIFY 秒重复一次）
-            prev = last_alert.get(name, 0)
-            if _elapsed(now, prev) < RENOTIFY:
-                continue
-            try:
-                started = datetime.fromtimestamp(start).strftime("%Y-%m-%d %H:%M:%S")
-                msg = (f"检查项: {name}\n"
-                       f"详情: {detail}\n"
-                       f"已持续: {fmt_dur(dur)}（阈值 {FAIL_MIN} 分钟）\n"
-                       f"首次发现: {started}\n"
-                       f"影响: {'全链路推送中断' if name == 'health' else '对应服务不可用'}\n"
-                       f"排查: pc/logs/*.log")
-                LOG.error(f"告警 {name}: {detail}")
-                # P2-7：只有**真送出去**才记 last_alert。原实现在 send_alert
-                # 之前就打时间戳 —— 三条通道同时失败时（17:21 事故形态）同一
-                # 故障 1800s 内不再尝试，最坏把整轮告警全丢掉。失败就下一轮
-                # （60s 后）立刻重试。
-                if send_alert(f"[FxxkPush] {name} 故障 {fmt_dur(dur)}", msg):
-                    last_alert[name] = now
+        # ---- P2-2：同轮红项合并成一条「N 项异常」，恢复也合并 ----
+        # 单项键：同一项每 RENOTIFY 才重复；全局键：任何告警刚发过，重复项
+        # 先憋着 —— 否则 5 项错峰到期就是每轮各发各的、240 条/天（backlog
+        # P2-2）。首次告警不等全局键：新故障要立刻喊。发送失败不落任何时间
+        # 戳，下一轮（60s）整批重试（P2-7 语义原样保留）。
+        try:
+            if red_batch:
+                due = [(n, d, du, st_) for n, d, du, st_ in red_batch
+                       if n not in last_alert
+                       or (_elapsed(now, last_alert[n]) >= RENOTIFY
+                           and _elapsed(now, last_any_alert) >= RENOTIFY)]
+                if due:
+                    parts, max_dur = [], 0.0
+                    for n, d, du, st_ in due:
+                        started = datetime.fromtimestamp(st_).strftime("%Y-%m-%d %H:%M:%S")
+                        LOG.error(f"告警 {n}: {d}")
+                        max_dur = max(max_dur, du)
+                        parts.append(
+                            f"检查项: {CHECK_CN.get(n, n)}（{n}）\n"
+                            f"详情: {d}\n"
+                            f"已持续: {fmt_dur(du)}（阈值 {FAIL_MIN} 分钟）\n"
+                            f"首次发现: {started}\n"
+                            f"影响: {CHECK_IMPACT.get(n, '对应功能不可用')}\n"
+                            f"排查: {_debug_hint(n, d)}")
+                    if len(due) == 1:
+                        n0 = due[0][0]
+                        title = f"[FxxkPush] {CHECK_CN.get(n0, n0)}故障 {fmt_dur(due[0][2])}"
+                    else:
+                        title = f"[FxxkPush] {len(due)} 项检查异常（最长 {fmt_dur(max_dur)}）"
+                    if send_alert(title, "\n\n".join(parts)):
+                        sent_at = time.time()
+                        for n, *_ in due:
+                            last_alert[n] = sent_at   # P2-7：真送出去才记
+                        last_any_alert = sent_at
+                    else:
+                        LOG.error(f"告警发送失败，下一轮重试: {[n for n, *_ in due]}")
+        except Exception as e:
+            # r8 P1-2：msg 组装/send_alert 外围的任何异常都不许穿透到主循环
+            LOG.error(f"告警段异常(已隔离, 下一轮重试): {[n for n, *_ in red_batch]} {e!r}")
+
+        # ---- P2-2：恢复合并成一条；失败进 recover_pending，下一轮真重试 ----
+        try:
+            cands: dict[str, tuple[str, float, str]] = {}
+            for item in recover_pending.values():
+                if item[0] not in fault_since:    # 又红了 = 恢复取消，不发旧账
+                    cands[item[0]] = item
+            for item in rec_batch:
+                cands[item[0]] = item             # 本轮新恢复覆盖旧的
+            if cands:
+                parts = [f"检查项: {CHECK_CN.get(n, n)}（{n}）\n"
+                         f"已恢复（故障持续 {fmt_dur(d)}）\n{det}"
+                         for n, d, det in cands.values()]
+                if len(cands) == 1:
+                    title = f"[FxxkPush] {next(iter(cands))} 已恢复"
                 else:
-                    LOG.error(f"告警发送失败，下一轮重试: {name}")
-            except Exception as e:
-                # r8 P1-2：msg 组装/send_alert 外围的任何异常都不许穿透
-                # 到主循环 —— 一次 datetime 转换失败就让监控停摆是不可接受的。
-                LOG.error(f"告警段异常(已隔离, 下一轮重试): {name} {e!r}")
+                    title = f"[FxxkPush] {len(cands)} 项检查已恢复"
+                if send_alert(title, "\n\n".join(parts)):
+                    for n in cands:
+                        last_alert.pop(n, None)
+                        recover_pending.pop(n, None)
+                else:
+                    for n, d, det in cands.values():
+                        recover_pending[n] = (n, d, det)
+                    LOG.error(f"恢复通知发送失败，下一轮重试: {list(cands)}")
+        except Exception as e:
+            LOG.error(f"恢复通知段异常(已隔离): {e!r}")
 
         # P1-1：隧道是通的才自动拉起死掉的服务 —— 和 start_services 的健康门
         # 同一条哲学：隧道没就绪时把它们全拉起来，只会对着 2586 空转刷错

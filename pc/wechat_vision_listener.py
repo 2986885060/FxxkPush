@@ -355,12 +355,14 @@ def analyze(bgra, w, h, app: str) -> dict | None:
         return None
 
 
-def push(title, message, priority=4):
+def push(title, message, priority=4, topic="fp-pc"):
     # trace 由 main() 的每轮扫描创建，这里沿用它 —— 截图/识别/推送/归档
     # 同一轮共享一个 id，tags_with_trace 在无 trace 时会自己补一个。
+    # P2-3：topic 默认 fp-pc（走 AI 分诊）；采集停摆告警直推 fp-phone，
+    # 不给二道闸把「监控自己坏了」判成「忽略」的机会。
     try:
         r = httpx.post(NTFY_BASE + "/", timeout=10, trust_env=False, json={
-            "topic": "fp-pc", "title": title[:120], "message": message[:500],
+            "topic": topic, "title": title[:120], "message": message[:500],
             "priority": priority,
             "tags": pclog.tags_with_trace(["bell"]),
         }, headers=_auth())
@@ -374,23 +376,40 @@ def is_active_hours() -> bool:
     return ACTIVE_FROM <= datetime.now().hour < ACTIVE_TO
 
 
-def scan_app(app: str, cfg: dict) -> dict | None:
+def scan_app(app: str, cfg: dict) -> tuple[str, dict | None]:
+    """P2-3：返回 (状态, 结果)。原来任何失败都 return None，调用方却无条件
+    scanned += 1 —— 窗口找不到七轮照样心跳「2/2 apps scanned」，watchdog 的
+    quiet/link 双绿（2026-09-23 实测 08:35-11:35 连续 7 轮 window not found
+    而三项全绿，直到人工翻日志才发现）。
+
+    状态：
+      ok        —— 截图+识别完成，result 为 dict（unread 可能为空）
+      closed    —— 连该类名的窗口都没有 = 应用没开（没消息可漏，不算故障）
+      minimized —— 窗口在但太窄（min_w=0 找得到、min_w 找不到）= 最小化，
+                   采集不了（故障态：应用在跑但瞎了）
+      capture   —— PrintWindow 失败（故障态）
+      analyze   —— 识别失败（故障态，analyze 内部已 log error）
+    """
     info = find_window(cfg["class"], cfg["title"], cfg["min_w"])
     if not info:
-        log(f"[{app}] window not found (closed/tray?), skip")
-        return None
+        # 三态区分就在这二次探测：min_w=0 能不能找到
+        if find_window(cfg["class"], cfg["title"], 0):
+            log(f"[{app}] window too narrow (minimized?), skip")
+            return "minimized", None
+        log(f"[{app}] window not found (app closed?), skip")
+        return "closed", None
     hwnd, x, y, w, h = info
     if park_needed(hwnd):  # any part visible → park it
         move_offscreen(hwnd, w, h)
     cap = capture(hwnd)
     if not cap:
         log(f"[{app}] capture failed")
-        return None
+        return "capture", None
     result = analyze(*cap, app)
     if result is None:
-        return None
+        return "analyze", None
     result["_app"] = app
-    return result
+    return "ok", result
 
 
 def handle(result: dict):
@@ -462,22 +481,53 @@ def main():
         else:
             log(f"[{app}] not found at startup (will retry each cycle)")
 
+    # P2-3：连续 2 轮「应用在跑但采不了」直推手机 —— 必须放 while 外面，
+    # 否则每轮重置、永远到不了 2
+    fault_streak: dict[str, int] = {}
+    fault_alerted: set[str] = set()
     while True:
         if not is_active_hours():
             log("night quiet hours, sleeping 10min")
             time.sleep(600)
             continue
-        time.sleep(POLL_MIN * 60)
+        # P2-9：一口气睡满 30min 时，夜间最后一行（如 07:55）到 08:00 换挡
+        # 后的首个心跳之间会隔 600+1800+两段 90s 识别 ≈ 2580s，离 quiet 阈值
+        # 2700s 只剩 2 分钟，AI 稍慢每天早上误报。分段睡：每 300s 一条心跳，
+        # 最大相邻间隔降到 300s + 一轮扫描。
+        slept = 0
+        while slept < POLL_MIN * 60:
+            time.sleep(300)
+            slept += 300
+            log(f"sleep heartbeat: {slept}/{POLL_MIN * 60}s")
         scanned = 0
         for app, cfg in TARGETS.items():
             # 每轮每个 app 一个 trace：截图、识别、推送、归档全用同一个 id，
             # 出问题时 grep 一次就能拉出这一轮的完整过程
             pclog.set_trace_id(None)
             try:
-                result = scan_app(app, cfg)
-                if result:
+                state, result = scan_app(app, cfg)
+                if state == "ok":
                     handle(result)
-                scanned += 1
+                    scanned += 1          # P2-3：只数真正扫完的（原来失败也 +1）
+                    fault_streak[app] = 0
+                    fault_alerted.discard(app)
+                elif state == "closed":
+                    fault_streak[app] = 0      # 没开应用：不是故障，别误报
+                    fault_alerted.discard(app)
+                else:                          # minimized / capture / analyze
+                    fault_streak[app] = fault_streak.get(app, 0) + 1
+                    n = fault_streak[app]
+                    if n >= 2 and app not in fault_alerted:
+                        # 故障态直推 fp-phone（不经 AI 二道闸）；推失败不记
+                        # alerted，下一轮（30min）重试
+                        if push(f"[FxxkPush] {app} 采集停摆",
+                                f"连续 {n} 轮采集失败（{state}）：视觉分诊静默停摆，"
+                                f"该应用的新消息不会推手机。\n"
+                                f"排查: pc/logs/wechat_vision.log；窗口别最小化，"
+                                f"拖到屏外即可（见「拖走聊天窗口.bat」）。",
+                                priority=4, topic="fp-phone"):
+                            fault_alerted.add(app)
+                            log(f"FAULT_ALERT [{app}] state={state} streak={n} -> phone")
             except Exception as e:
                 log(f"[{app}] cycle error: {e!r}")
             finally:

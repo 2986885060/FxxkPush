@@ -48,10 +48,26 @@ def load_state():
             _state.update(json.loads(STATE_FILE.read_text()))
         except Exception:
             pass
+    # P2-8：形状校验。文件可能变成「合法 JSON 但类型不对」（手工改坏、或
+    # 半截内容被外力拼成合法结构），那时 allowed() 里的 .get 会在每个
+    # check_* 里恒抛 -> gray("monitor-error") 每 60s 一条，而灰区要过 AI
+    # 大概率被判忽略 —— 等于硬规则永久失效且无人发现。类型不对就重置：
+    # 冷却状态丢了可以重建，最坏是同一件事多推一次，远好过永不推送。
+    if not isinstance(_state.get("cooldowns"), dict):
+        _state["cooldowns"] = {}
+    if not isinstance(_state.get("counts"), dict):
+        _state["counts"] = {}
+    if not isinstance(_state.get("unit_seen"), dict):
+        _state["unit_seen"] = {}
 
 def save_state():
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(_state))
+    # P2-8：原子写（PC 侧早就 tmp+replace，这里是最后一处直写）。
+    # write_text 被 OOM kill / 断电打断会留下半截 JSON，load_state 的
+    # try 只能整份丢弃 -> 冷却全失、同一批告警风暴重推。
+    tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(_state))
+    os.replace(tmp, STATE_FILE)
 
 def allowed(kind, cooldown=COOLDOWN_DEFAULT):
     """True if this push kind is outside its cooldown window."""
@@ -207,16 +223,27 @@ def check_units():
          "--no-pager", "--plain"],
         capture_output=True, text=True, timeout=30)
     failed = [l.split()[0] for l in p.stdout.splitlines() if l.strip()]
+    seen = _state.get("unit_seen")
+    if not isinstance(seen, dict):
+        seen = _state["unit_seen"] = {}
     for unit in failed:
         base = unit.split(".")[0]
         if base in UNITS_TO_WATCH or base.startswith("fuckpush"):
+            seen.setdefault(unit, time.time())   # P2-1：首次进入 failed 的时刻
             if allowed(f"unit-failed:{unit}", cooldown=1800):
                 n = _state["counts"].get(f"unit-failed:{unit}", 0)
                 extra = f" (+{n})" if n else ""
-                push("VPS 服务挂了", f"{unit} 进入 failed 状态{extra}",
+                dur_min = int((time.time() - seen.get(unit, time.time())) // 60)
+                push("VPS 服务挂了",
+                     f"{unit} 进入 failed 状态，已持续约 {dur_min} 分钟{extra}\n"
+                     f"排查: systemctl status {unit}; "
+                     f"journalctl -u {unit} -n 50 --no-pager",
                      priority=4, tags=["boom"])
         else:
             gray("unit-failed", {"unit": unit})
+    # P2-1：已恢复的 unit 清出计时，下次再挂从零开始
+    for u in [k for k in list(seen) if k not in failed]:
+        seen.pop(u, None)
 
 # ---------- main ----------
 def main():

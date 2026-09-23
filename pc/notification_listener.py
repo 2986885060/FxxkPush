@@ -343,6 +343,75 @@ def replay_failed(cap: int = 20) -> None:
         log(f"replay: 补发 {done} 条上次运行推送失败的通知")
 
 
+# P2-5：三层告警的 2/3 层与 watchdog 共用（alert_fallback 不建任何文件句
+# 柄，见其 docstring —— 这是它能被两个进程同时 import 而不制造轮转竞争的
+# 全部原因）
+from alert_fallback import push_vps, push_toast
+
+_access_alert_at = 0.0
+
+
+def _push_alert(title: str, message: str) -> bool:
+    """P2-5：listener 的告警原来只有本地隧道一条通道 —— 「看门人已死」的
+    时刻隧道（同为 ntfy 链路）很可能也死了，单通道 = 静默。复用 watchdog 的
+    三层降级，每层各自 try（P1-2 同款边界，一层失败只降级不击穿）。"""
+    payload = {
+        "topic": "fp-phone",
+        "title": title[:120],
+        "message": message[:900],
+        "priority": 4,
+        "tags": pclog.tags_with_trace(["rotating_light"]),
+    }
+    try:
+        r = httpx.post(NTFY_BASE + "/", json=payload, headers=_auth(),
+                       timeout=10, trust_env=False)
+        if r.status_code == 200:
+            log(f"告警已送达(本地隧道): {title}")
+            return True
+    except Exception as e:
+        log(f"告警本地隧道失败: {e!r}")
+    try:
+        if push_vps(payload, LOG):
+            log(f"告警已送达(VPS-SSH兜底): {title}")
+            return True
+    except Exception as e:
+        log(f"告警 VPS 通道异常: {e!r}")
+    try:
+        if push_toast(title, message, LOG):
+            log(f"告警仅本机 toast(网络通道都失败): {title}")
+            return True
+    except Exception as e:
+        log(f"告警 toast 通道异常: {e!r}")
+    log(f"告警三条通道都失败: {title}")
+    return False
+
+
+def check_access() -> None:
+    """P2-4：WinRT 权限只在启动时 request_access_async 查过一次；运行中被
+    系统撤掉后 get_notifications 恒返回空 —— 零异常、心跳照打、quiet/link
+    双绿，分诊链路静默死亡到下次登录（backlog P2-4）。周期重查：实测它是
+    同步方法 get_access_status()（不是属性），撤了直推手机。"""
+    global _access_alert_at
+    try:
+        st = UserNotificationListener.current.get_access_status()
+        if st == UserNotificationListenerAccessStatus.ALLOWED:
+            return
+    except Exception as e:
+        log(f"access status 查询失败: {e!r}")
+        return
+    gap = time.time() - _access_alert_at
+    if 0 <= gap < 1800:
+        return          # 同一故障 30 分钟一次（同 check_watchdog_hb 的节流）
+    _access_alert_at = time.time()
+    LOG.error(f"WinRT 通知访问权限被撤 (status={st}) —— 新通知不再进分诊，心跳照打也是空转")
+    _push_alert(
+        "[FxxkPush] 通知访问权限被撤",
+        "系统撤掉了通知监听权限，Windows 通知不再进入分诊，"
+        "QQ/微信等新通知会静默丢失。\n"
+        "恢复: 设置 → 系统 → 通知 → 授权监听（或重跑 probe_notifications.py）。\n"
+        "排查: pc/logs/notification_listener.log")
+
+
 def check_watchdog_hb() -> None:
     """P0-2：看门人也得有人看（交叉检查，进程独立于 watchdog）。"""
     global _hb_alert_at
@@ -359,19 +428,12 @@ def check_watchdog_hb() -> None:
                         # 宁可多喊一次也好过告警被永久静音
     _hb_alert_at = time.time()
     LOG.error(f"watchdog 心跳 {int(age)}s 未更新 —— 看门狗可能已死，告警能力失效")
-    try:
-        r = httpx.post(NTFY_BASE + "/", json={
-            "topic": "fp-phone",
-            "title": "[FxxkPush] watchdog 心跳超时",
-            "message": (f"watchdog.hb 已 {int(age // 60)} 分钟未更新，看门狗可能已退出："
-                        f"health/procs/link/disk 四项巡检与三层告警同时失效。\n"
-                        f"排查: pc/logs/watchdog.log，或直接跑 restart_services.bat"),
-            "priority": 4,
-            "tags": pclog.tags_with_trace(["rotating_light"]),
-        }, headers=_auth(), timeout=10, trust_env=False)
-        log(f"watchdog 心跳告警推送: HTTP {r.status_code}")
-    except Exception as e:
-        log(f"watchdog 心跳告警推送失败: {e!r}")
+    # P2-5：单通道在「看门人已死」场景下不可靠 —— 走三层降级（local→VPS→toast）
+    _push_alert(
+        "[FxxkPush] watchdog 心跳超时",
+        f"watchdog.hb 已 {int(age // 60)} 分钟未更新，看门狗可能已退出："
+        f"health/procs/link/disk 四项巡检与三层告警同时失效。\n"
+        f"排查: pc/logs/watchdog.log，或直接跑 restart_services.bat")
 
 
 async def main():
@@ -434,6 +496,8 @@ async def main():
         tick += 1
         if tick % 60 == 0:              # 每 3 分钟看一眼看门狗还活着没
             check_watchdog_hb()
+        if tick % 200 == 0:             # P2-4：每 10 分钟复查 WinRT 权限
+            check_access()
         if tick % 100 == 0:
             # r7-10：事件驱动 + WinRT 权限被撤后 get_notifications 返回空也
             # 不留痕，「活着但没干活」和「健康」在日志上完全同形（实测 6 小时
