@@ -295,6 +295,7 @@ curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0
 - [x] v0.3.0：统一日志 `pc/core/pclog.py`（格式/出口/level/trace_id 贯穿全链路）、启动健康门（`health=200` 才起服务）、管道自检看门狗（故障绕过 AI 直推手机，SSH 独立告警通道）、httpx 系统代理毒化修复（`trust_env=False`）
 - [x] v0.4.0：误判反馈闭环（`pc/core/fp_feedback.py`）—— 手机端 👍/👎 按钮 → `fp-feedback` → 反馈归档含内容快照 → 源级规则自动纠正（3 次误判自动静默并跳过 AI，👍 可撤销），闭合「推送 → 人肉判定 → 规则纠正 → 少推」这一环
 - [x] v0.6.0：P2 留档清仓（告警中文化、告警合并与恢复重试、视觉采集三态与直推、通知权限定时复查、告警三层降级、fp-vps 通道 fail-open、state 形状校验与原子写、夜间分段心跳）+ PC 侧分包重组（`pc/services`·`pc/core`·`pc/bootstrap`，一次性碎片归并，视觉监听更名 `vision_listener.py`）+ 配置示例脱敏
+- [ ] v0.7.0：视觉截图瘦身与留档 —— 企微全尺寸截图（1233×813 ≈ 132KB/张，微信 544×519 ≈ 45KB）识别前降采样，降低上传体积与识别成本；截图落盘并滚动保留 24 小时，清理时机 = 重新开机时 + 每日凌晨
 - [ ] 钉钉 / 学习通等更多 App 深度适配
 - [ ] 每日日报（AI 汇总当天事件/误判，22:00 推手机；`fp_feedback.stats()` 已备好误判统计）
 - [ ] 误判样本 → 27B 模型微调（语料已在 `pc/feedback.jsonl` 自包含落地，缺训练流程）
