@@ -2,7 +2,7 @@
 """FxxkPush vision listener v0.6 — WeChat + WeCom (企业微信).
 
 Every POLL minutes, screenshots both apps' main windows (parked
-off-screen) and sends them to MiMo vision for triage.
+off-screen) and sends them to the cloud/local OCR model for triage.
 
 Important rules (user-defined):
   - @所有人 or @我 in any chat  -> important
@@ -253,7 +253,7 @@ def capture(hwnd) -> tuple[bytes, int, int] | None:
 
 
 def bgra_to_png(bgra: bytes, w: int, h: int) -> bytes:
-    """BGRA 原始数据 -> PNG bytes（给 MiMo 视觉 API 上传）。
+    """BGRA 原始数据 -> PNG bytes（给云端/本地OCR模型视觉 API 上传）。
 
     Pillow（C 实现）替代了原来的纯 Python 逐像素循环：800x600 实测
     Pillow **5.0ms** vs 纯 Python **172.3ms = 34.4x**，两条路径输出逐像素

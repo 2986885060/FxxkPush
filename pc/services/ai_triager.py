@@ -3,7 +3,7 @@
 
 Consumes four ntfy topics (fp-pc: Windows notifications, fp-gray: VPS
 gray-zone events, fp-vps: VPS hard alerts, fp-feedback: the 👍/👎 buttons
-on pushes this service sent), asks MiMo to classify importance, and:
+on pushes this service sent), asks the configured cloud/local OCR model to classify importance, and:
   - important  -> publish to fp-phone (phone buzzes)
   - unimportant-> silent archive
 
@@ -49,10 +49,10 @@ if not isinstance(CONFIG, dict):
     # 每 5 分钟只留一行 FATAL。降级成空 dict，由 setdefault 补齐必需键。
     CONFIG = {}
 # 补齐必需键：即使配置文件被手改少了字段，也不该在运行中途 KeyError。
-CONFIG.setdefault("model", "mimo-v2.6-flash")
+CONFIG.setdefault("model", "云端/本地OCR模型")
 CONFIG.setdefault("dedup_window_sec", 1800)
 CONFIG.setdefault("api_key", "")
-CONFIG.setdefault("base_url", "https://api.xiaomimimo.com/v1")
+CONFIG.setdefault("base_url", "云端/本地OCR模型端点")
 CONFIG.setdefault("max_tokens", 200)
 
 NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
