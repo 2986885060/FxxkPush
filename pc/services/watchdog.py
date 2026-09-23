@@ -398,34 +398,33 @@ def check_quiet() -> tuple[bool, str]:
 # VPS 的 fuckpush-monitor 死了/被停/token 失效时，PC 五项全绿、手机零告警，
 # 而它才是 OOM/磁盘/SSH 登录/unit 挂掉这些硬规则的唯一采集者 —— 典型的
 # 「最需要它的时刻它哑了，还没人知道」。
-VPS_CHECK_INTERVAL = 300   # SSH 探测 VPS 的最小间隔（结果缓存，别每 60s 都连）
-VPS_FAIL_TS_WINDOW = 900   # gray.log 最后一条 push-failed 多新才算「推送坏了」
+VPS_CHECK_INTERVAL = 300   # 心跳拉取的最小间隔（结果缓存，别每 60s 都拉）
+HB_MAX_AGE = 600           # 心跳超过这个年龄 = vps 红（2x VPS 侧 HB_INTERVAL）
+HB_LOOKBACK = 900          # 拉取 fp-vps-hb 事件的回看窗口
 _vps_cache: dict = {"ts": 0.0, "ok": True, "detail": "vps 尚未首查"}
 
 
 def check_vps() -> tuple[bool, str]:
-    """VPS 监控存活 + 推送可达（每 VPS_CHECK_INTERVAL 秒真探一次，余下吃缓存）。
+    """VPS 监控存活（反向心跳，B 方案）：VPS 每 HB_INTERVAL 秒发一条到
+    fp-vps-hb，这里只经本地隧道拉最近事件算年龄 —— 零新建 SSH 连接。
 
-    三种要抓的黑屏形态（第 8 轮报告 P0-1）：
-      1. fuckpush-monitor 持续死亡或持续崩溃循环 —— systemd 的
-         Restart=on-failure 兜得住瞬时崩溃，兜不住「起来就崩」（那种
-         is-active 会停在 activating，不算活）；
-      2. FP_NTFY_TOKEN 失效 -> _publish 恒 401 -> 只落它自己的 gray.log，
-         PC 的 health 用的是 PC 自己的 token、照常 200（2026-09-22 实测
-         两个 token 同值且都 200，此形态当下未发生，但没有机制能发现它
-         哪天发生 —— 这条检查就是那个机制）；
-      3. 崩溃循环的「启动 push」救不了场 —— 它会被 AI 判「忽略」静默归档，
-         再被 dedup 压 1800s。
+    为什么替换主动 SSH：PC 开 TUN/系统代理时，到 VPS:35846 的**新建**
+    SSH 握手被代理链路间歇吞掉（2026-09-23 实测三轮 10-26 分钟假告警，
+    服务端 sshd 无罪、已建立的长连接不受影响），而本检查走
+    127.0.0.1:2586 是隧道内 HTTP，不产生任何新外部连接。
 
-    判据与故障域切分：
-      - SSH 通 -> 看 systemctl is-active（active 才算活）+ gray.log 最后
-        一条是否为新近的 ntfy-push-failed（推送可达性，只报「已知坏」
-        不报「未知好」）；
-      - SSH 不通 -> 先探本地隧道：隧道通说明 VPS 活着、是本检查自己的
-        凭据/端口坏了（health 不会报这个）-> 红；隧道也不通则是整体网络
-        故障，health 必然也红 -> 这里返回绿让 health 去喊，避免同一
-        故障域双报（第 8 轮 P2-2 的告警风暴缺口）。
-    结果缓存 VPS_CHECK_INTERVAL 秒：一次 SSH 最多十几秒，不能每轮都拖。
+    抓的黑屏形态（对原实现只增不减）：
+      1. fuckpush-monitor 死亡/崩溃循环 -> 心跳停更 -> 红
+         （原 SSH 方案对「monitor 死但 sshd 活」反而探不出来）；
+      2. FP_NTFY_TOKEN 失效 -> 心跳 publish 401 -> PC 拉不到新事件 -> 红
+         （原靠 gray.log 尾行 ntfy-push-failed，现在心跳自身即信号）；
+      3. VPS ntfy 死 -> 心跳发不出，health 同时也红（传输域归 health）。
+    unit-failed 等事件告警仍由 VPS 侧硬规则直推 fp-vps，不依赖本检查。
+
+    判据：拉 /fp-vps-hb/json?since=now-HB_LOOKBACK&poll=1，最新事件年龄
+    <= HB_MAX_AGE 绿，超龄/零事件红。拉取本身失败（隧道/本地 ntfy 层）
+    属 health 的故障域 -> 返回绿让 health 去喊，避免同一故障域双报（P2-2）。
+    结果缓存 VPS_CHECK_INTERVAL 秒（缓存形状与旧实现一致）。
     """
     now = time.time()
     if now - _vps_cache["ts"] < VPS_CHECK_INTERVAL:
@@ -438,62 +437,36 @@ def check_vps() -> tuple[bool, str]:
     # 全程按 P1-2 的教训包住：这条检查自己绝不许抛（抛了会被主循环记成
     # 「检查器异常」红 5 分钟，制造假告警）
     try:
-        secret = HERE.parent / "vps.secret"
-        if not secret.exists():
-            return _set(False, "vps: vps.secret 缺失（无法探测 VPS 监控）")
-        host, port, user, pwd = secret.read_text().split()
-        import paramiko
-        cli = None
-        try:
-            cli = paramiko.SSHClient()
-            cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            cli.connect(host, port=int(port), username=user, password=pwd,
-                        timeout=10, banner_timeout=15, auth_timeout=10)
-            _, out, err = cli.exec_command(
-                "systemctl is-active fuckpush-monitor 2>/dev/null; echo ' --- '; "
-                "tail -1 /var/log/fuckpush/gray.log 2>/dev/null",
-                timeout=15)
-            text = out.read().decode("utf-8", "replace")
-        finally:
-            if cli is not None:
-                try:
-                    cli.close()
-                except Exception:
-                    pass
+        tok = _token()
+        r = httpx.get(f"{NTFY_BASE}/fp-vps-hb/json",
+                      params={"since": int(now - HB_LOOKBACK), "poll": "1"},
+                      headers={"Authorization": f"Bearer {tok}"} if tok else {},
+                      timeout=10, trust_env=False)
+        if r.status_code in (401, 403):
+            return _set(False, f"vps: 心跳拉取被拒 http={r.status_code}"
+                               f"（PC 侧 ntfy token 无效或被撤销）")
+        r.raise_for_status()
+        last_ts = 0
+        for line in r.text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                last_ts = max(last_ts, int(json.loads(line).get("time", 0)))
+            except Exception:
+                pass        # 单行脏数据不据此判红（同 gray 尾行哲学）
+        if not last_ts:
+            return _set(False, f"vps: {HB_LOOKBACK}s 内零心跳"
+                               f"（fuckpush-monitor 停摆，或它的 ntfy 发布被拒）")
+        age = int(now - last_ts)
+        if age > HB_MAX_AGE:
+            return _set(False, f"vps: 心跳已 {age}s 未更新（阈值 {HB_MAX_AGE}s，"
+                               f"fuckpush-monitor 可能死亡或崩溃循环）")
+        return _set(True, f"vps: 心跳 {age}s 前（monitor→ntfy 链路通）")
     except Exception as e:
-        # SSH 失败：先问隧道。隧道活着 -> 是本检查的凭据/端口坏了（health
-        # 永远不会报这个，必须这里红）；隧道也死 -> 网络故障域，交 health。
-        tunnel_ok = False
-        try:
-            tunnel_ok = httpx.get(f"{NTFY_BASE}/v1/health", timeout=5,
-                                  trust_env=False).status_code == 200
-        except Exception:
-            tunnel_ok = False
-        if tunnel_ok:
-            return _set(False, f"vps: SSH 探测失败(隧道却通,凭据/端口问题): "
-                               f"{type(e).__name__}: {e}")
-        return _set(True, "vps: SSH 与隧道都不通=网络故障域，由 health 覆盖")
-
-    active_part, _, gray_part = text.partition(" --- ")
-    active = active_part.strip()
-    if active != "active":
-        return _set(False, f"vps: fuckpush-monitor 状态={active or '空'}"
-                           f"（持续崩溃或被停，硬规则告警全发不出）")
-
-    # gray.log 最后一条是新近的 ntfy-push-failed -> token 失效/ntfy 拒收
-    gray_line = gray_part.strip().splitlines()
-    if gray_line:
-        try:
-            last = json.loads(gray_line[-1])
-            if (last.get("kind") == "ntfy-push-failed"
-                    and now - float(last.get("ts", 0)) < VPS_FAIL_TS_WINDOW):
-                data = last.get("data") or {}
-                return _set(False, "vps: 推送被拒 http="
-                           f"{data.get('http_code')}（token 失效或 ntfy 拒收，"
-                           f"VPS 硬规则发不出去，只落了它本地 gray.log）")
-        except Exception:
-            pass    # 尾行不是 JSON/时间戳坏 -> 不据此判红，is-active 已覆盖
-    return _set(True, "vps: monitor active 且无新推送失败")
+        # 拉取失败 = 传输层（隧道/本地 ntfy）——health 的故障域。
+        return _set(True, f"vps: 心跳不可测({type(e).__name__}: {str(e)[:80]})，"
+                          f"交由 health 判定")
 
 
 CHECKS = [("health", check_health), ("procs", check_procs),

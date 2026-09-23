@@ -31,10 +31,12 @@ NTFY_TOKEN = os.environ.get("FP_NTFY_TOKEN", "")
 SELF_IPS = tuple(x.strip() for x in os.environ.get("FP_SELF_IPS", "").split(",") if x.strip())
 TOPIC_HARD = "fp-vps"        # hard-rule alerts -> PC (PC relays to phone after AI)
 TOPIC_GRAY = "fp-gray"       # gray-zone events -> PC for AI triage
+TOPIC_HB = "fp-vps-hb"       # heartbeat -> PC watchdog pulls (reverse probe, B方案)
 GRAY_LOG = Path("/var/log/fuckpush/gray.log")
 STATE_FILE = Path("/var/lib/fuckpush/state.json")
 COOLDOWN_DEFAULT = 1800      # 30 min
 CHECK_INTERVAL = 60          # main loop, seconds
+HB_INTERVAL = 300            # heartbeat every 5 min (PC watchdog judges by age)
 DISK_THRESHOLD = 90          # percent
 
 UNITS_TO_WATCH = ["s-ui", "maddy", "nginx", "ntfy"]
@@ -249,6 +251,7 @@ def check_units():
 def main():
     load_state()
     last_check = time.time()
+    last_hb = 0.0              # 0 -> first loop iteration sends heartbeat immediately
     try:
         push("FuckPush VPS 监控已启动", "监控进程上线，硬规则生效", priority=2,
              tags=["white_check_mark"])
@@ -266,6 +269,18 @@ def main():
         except Exception as e:
             gray("monitor-error", {"error": repr(e)})   # gray 自身不再抛 (r7-11)
         last_check = loop_start
+        # Reverse heartbeat (B plan): PC watchdog no longer opens new SSH
+        # connections to probe us (TUN/proxy swallows new handshakes ->
+        # false alarms); it just pulls fp-vps-hb events over the tunnel and
+        # judges their age. Startup counts as t=0 so the first heartbeat
+        # goes out on the first loop.
+        if loop_start - last_hb >= HB_INTERVAL:
+            _publish(TOPIC_HB, "hb",
+                     json.dumps({"ts": int(loop_start),
+                                 "load": round(os.getloadavg()[0], 2)},
+                                ensure_ascii=False),
+                     priority=1, tags=["heartbeat"])
+            last_hb = loop_start
         try:
             save_state()
         except Exception as e:
