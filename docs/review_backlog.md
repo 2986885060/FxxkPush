@@ -32,7 +32,7 @@
   RENOTIFY 改成全局+单项双键。无夜间免打扰属设计取舍，不算缺陷。
 
 - [ ] **P2-3　微信窗口被最小化/关闭 → 采集静默停摆但三项全绿**
-  — `wechat_vision_listener.py:147-167,377-393,472-488`
+  — `vision_listener.py:147-167,377-393,472-488`
   窗口宽 < min_w(400/500) → `find_window` 返回 None → 每轮只打一行
   `window not found`；`scaned += 1` 照常 → 心跳 `2/2 apps scanned` 绿、quiet 绿；
   watchdog `_ERR_PAT` 要求 300s 内 ≥3 条错误而 wechat 每 30min 才 1 条 → link 绿。
@@ -71,7 +71,7 @@
   重置；写盘走 tmp+`os.replace`。
 
 - [ ] **P2-9　wechat 08:00 换挡的 quiet 余量只有约 2 分钟**
-  — `wechat_vision_listener.py:465-488` + `watchdog.py:75`
+  — `vision_listener.py:465-488` + `watchdog.py:75`
   夜间循环 600s 一行 → 8:00 后先 `sleep(1800)` 再扫 → 相邻日志间隔恒 ≈2400s，
   加上 2 个 app 各 90s AI 超时最多 2580s，阈值 2700s，余量 ≈120s。AI 慢一点
   就会在每天 08:40 左右误报一次。修法：夜间/换挡期在 sleep 里分段打心跳，

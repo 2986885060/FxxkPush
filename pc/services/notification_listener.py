@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 import httpx
-from winrt.windows.ui.notifications import NotificationKinds
+from winrt.windows.ui.notifications import KnownNotificationBindings, NotificationKinds
 from winrt.windows.ui.notifications.management import (
     UserNotificationListener,
     UserNotificationListenerAccessStatus,
@@ -25,7 +25,7 @@ from winrt.windows.ui.notifications.management import (
 
 # ---------- config ----------
 NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
-_SECRET = Path(__file__).parent / "ntfy.secret"
+_SECRET = Path(__file__).resolve().parents[1] / "ntfy.secret"
 try:
     NTFY_TOKEN = os.environ.get("FP_NTFY_TOKEN") or (
         _SECRET.read_text().strip() if _SECRET.exists() else "")
@@ -37,8 +37,8 @@ except Exception:
     NTFY_TOKEN = ""
 TOPIC = "fp-pc"
 POLL_SEC = 3
-ARCHIVE = Path(__file__).parent / "notifications.jsonl"
-STATE = Path(__file__).parent / "listener_state.json"
+ARCHIVE = Path(__file__).resolve().parents[1] / "notifications.jsonl"  # pc/
+STATE = Path(__file__).resolve().parents[1] / "listener_state.json"  # pc/
 
 # apps worth watching; everything else is captured but flagged unknown
 WATCHLIST = {"QQ", "微信", "WeChat", "钉钉", "DingTalk", "TIM", "学习通",
@@ -54,7 +54,7 @@ SELF_MARKERS = {"fuckpush", "fxxkpush", "winotify", "python", "pythonw"}
 # pc_subscriber writes every toast it pops to this file; Windows hands the same
 # toast back to us as a notification a moment later (app name resolves to "?"),
 # so match on content instead of app identity.
-ECHO_FILE = Path(__file__).parent / "toast_echo.jsonl"
+ECHO_FILE = Path(__file__).resolve().parents[1] / "toast_echo.jsonl"
 ECHO_WINDOW = 180  # seconds
 
 # P1-2：推失败的通知挂在这里下一轮重试（3s 一轮、每轮只出队一条）。
@@ -67,7 +67,7 @@ PENDING_TTL = 900         # 15 分钟还没推出去就放弃：更旧的通知�
 # P0-2：watchdog 每轮写 logs/watchdog.hb，这里每 3 分钟看一眼 mtime。
 # watchdog 不在它自己的 WATCHED 里（没法自我监控），日志里的 heartbeat 也
 # 没有消费者 —— 它一死，四项巡检连同三层告警一起静默失效。
-HB_FILE = Path(__file__).parent / "logs" / "watchdog.hb"
+HB_FILE = Path(__file__).resolve().parents[1] / "logs" / "watchdog.hb"  # pc/logs
 _hb_alert_at = 0.0
 _seen_dirty = False       # save_seen 失败时置 True，下一轮继续重试落盘
 
@@ -126,6 +126,8 @@ def is_our_toast(texts) -> bool:
     return False
 
 
+sys.path[:0] = [str(Path(__file__).resolve().parents[1]),            # pc/
+                str(Path(__file__).resolve().parents[1] / "core")]   # 公共件 pclog/fp_feedback/alert_fallback
 import pclog
 LOG = pclog.get_logger("notification_listener")
 
@@ -408,7 +410,7 @@ def check_access() -> None:
         "[FxxkPush] 通知访问权限被撤",
         "系统撤掉了通知监听权限，Windows 通知不再进入分诊，"
         "QQ/微信等新通知会静默丢失。\n"
-        "恢复: 设置 → 系统 → 通知 → 授权监听（或重跑 probe_notifications.py）。\n"
+        "恢复: 设置 → 系统 → 通知 → 授权监听（或重跑 notification_listener.py --grant-access）。\n"
         "排查: pc/logs/notification_listener.log")
 
 
@@ -441,7 +443,7 @@ async def main():
     listener = UserNotificationListener.current
     access = await listener.request_access_async()
     if access != UserNotificationListenerAccessStatus.ALLOWED:
-        log("notification access DENIED — run probe_notifications.py first")
+        log("notification access DENIED — run notification_listener.py --grant-access first")
         return 1
     log(f"notification access OK, polling every {POLL_SEC}s -> topic {TOPIC}")
 
@@ -508,5 +510,36 @@ async def main():
         await asyncio.sleep(POLL_SEC)
 
 
+async def _probe_access() -> int:
+    """交互式请求通知读取权限并列出现有通知（原 probe_notifications.py，已并入）。
+
+    用法: python notification_listener.py --grant-access
+    弹窗里点允许（或 设置 > 隐私和安全性 > 通知 放行桌面应用）后能列出当前
+    通知即权限可用。跑一次即可（Access request 可能只弹一次）。
+    """
+    listener_ = UserNotificationListener.current
+    access = await listener_.request_access_async()
+    print("access request result:", access)
+    if access != UserNotificationListenerAccessStatus.ALLOWED:
+        print("-> DENIED. Open 设置 > 隐私和安全性 > 通知 and allow desktop apps,"
+              " then rerun. (Access request may only pop once per app identity.)")
+        return 1
+    notifs = await listener_.get_notifications_async(NotificationKinds.TOAST)
+    print(f"current notifications: {notifs.size}")
+    for i in range(min(notifs.size, 10)):
+        n = notifs.get_at(i)
+        app = n.app_info.display_info.display_name
+        try:
+            text = n.notification.visual.get_binding(
+                KnownNotificationBindings.toast_generic()).get_text_group()
+            lines = [t.text for t in text]
+        except Exception:
+            lines = ["<no text binding>"]
+        print(f"  [{i}] app={app!r} text={lines}")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--grant-access" in sys.argv:
+        sys.exit(asyncio.run(_probe_access()))
     asyncio.run(main())

@@ -23,8 +23,8 @@ from pathlib import Path
 
 import httpx
 
-HERE = Path(__file__).parent
-NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
+HERE = Path(__file__).resolve().parents[1]  # pc/（本文件在 pc/services/）
+NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/services/ntfy_tunnel.py)
 try:
     NTFY_TOKEN = ((HERE / "ntfy.secret").read_text().strip()
                   if (HERE / "ntfy.secret").exists() else "")
@@ -85,6 +85,8 @@ IGNORE_CHATS = {"微信支付", "公众号", "服务通知", "QQ邮箱提醒", "
                 "应用提醒", "失物招领&寻物启事"}
 
 
+sys.path[:0] = [str(Path(__file__).resolve().parents[1]),            # pc/
+                str(Path(__file__).resolve().parents[1] / "core")]   # 公共件 pclog/fp_feedback/alert_fallback
 import pclog
 LOG = pclog.get_logger("wechat_vision")
 
@@ -538,5 +540,40 @@ def main():
         log(f"idle heartbeat: cycle done, {scanned}/{len(TARGETS)} apps scanned")
 
 
+def park_main() -> None:
+    """一次性归位工具（原独立的 park_windows.py，已并入本文件）。
+
+    用法: python vision_listener.py park
+    把微信/企业微信窗口挪到屏幕外 —— 重启/重开 App 后手动跑一次，窗口就不
+    会坐在屏幕上。已在屏外的不动；对显示/分辨率/缩放变化免疫。
+    """
+    delay, retry = 3, 3
+    for attempt in range(retry):
+        found_any = False
+        for app, cfg in TARGETS.items():
+            info = find_window(cfg["class"], cfg["title"], cfg["min_w"])
+            if not info:
+                print(f"[{app}] 窗口未找到（没开或托盘中），跳过")
+                continue
+            hwnd, x, y, w, h = info
+            if park_needed(hwnd):
+                move_offscreen(hwnd, w, h)
+                print(f"[{app}] 已挪到屏幕外（显示器右边缘之外）")
+            else:
+                print(f"[{app}] 已在屏幕外，无需处理")
+            found_any = True
+        if found_any or attempt == retry - 1:
+            break
+        print(f"窗口还没就绪，{delay}s 后重试 ({attempt + 1}/{retry})...")
+        time.sleep(delay)
+    try:
+        input("\n完成，按回车关闭...")
+    except EOFError:
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] in ("park", "--park"):
+        park_main()
+    else:
+        main()

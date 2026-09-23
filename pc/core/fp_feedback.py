@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pclog
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parents[1]  # pc/（本文件在 pc/core/）
 # r7-7：**惰性**创建 handler。原来模块顶层 get_logger —— ai_triager 顶层
 # `import fp_feedback` 会连带在它进程里挂上 fp_feedback.log 的
 # RotatingFileHandler，于是「常驻 triager」和「手跑 CLI」各持一个句柄写同一
