@@ -43,7 +43,7 @@ import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parents[1]  # pc/（本文件在 pc/core/）
 LOG_DIR = Path(os.environ.get("FP_LOG_DIR") or (HERE / "logs"))
 
 # ntfy 只透传已知字段，自定义 header / 未知 JSON 字段一律被服务端丢弃

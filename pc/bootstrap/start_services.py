@@ -7,7 +7,7 @@
 70 分钟的静默故障就是这么起来的。
 
 用法：
-    python start_services.py          # 前台跑，看得到每一步
+    python pc/bootstrap/start_services.py  # 前台跑，看得到每一步
     restart_services.bat              # 包装它（双击入口）
 """
 from __future__ import annotations
@@ -22,13 +22,15 @@ from pathlib import Path
 import httpx
 import psutil
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parents[1]  # pc/（本文件在 pc/bootstrap/）
 PYW = HERE.parent / ".venv" / "Scripts" / "pythonw.exe"
 NTFY_BASE = "http://127.0.0.1:2586"
 HEALTH_URL = f"{NTFY_BASE}/v1/health"
 HEALTH_TIMEOUT = 60        # 秒：隧道要多久才算真起不来
 POST_HEALTH_DELAY = 1.5    # health 200 后给隧道一点热身时间
 
+sys.path[:0] = [str(Path(__file__).resolve().parents[1]),            # pc/
+                str(Path(__file__).resolve().parents[1] / "core")]   # 公共件 pclog/fp_feedback/alert_fallback
 import pclog
 LOG = pclog.get_logger("start_services")
 
@@ -38,7 +40,7 @@ ORDER = [
     "pc_subscriber.py",
     "notification_listener.py",
     "ai_triager.py",
-    "wechat_vision_listener.py",
+    "vision_listener.py",
     "watchdog.py",
 ]
 EXPECT_PER_SCRIPT = 2       # venv pythonw.exe 是 shim，真身另起一个：合法 2 个
@@ -114,7 +116,7 @@ def list_ours() -> list[str]:
 
 def start(script: str) -> None:
     LOG.info(f"启动 {script}")
-    subprocess.Popen([str(PYW), str(HERE / script)],
+    subprocess.Popen([str(PYW), str(HERE / "services" / script)],
                      cwd=str(HERE),
                      creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW)
 

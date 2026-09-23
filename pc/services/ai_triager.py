@@ -26,10 +26,12 @@ from pathlib import Path
 
 import httpx
 
+sys.path[:0] = [str(Path(__file__).resolve().parents[1]),            # pc/
+                str(Path(__file__).resolve().parents[1] / "core")]   # 公共件 pclog/fp_feedback/alert_fallback
 import pclog
 import fp_feedback
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parents[1]  # pc/（本文件在 pc/services/）
 try:
     CONFIG = json.loads((HERE / "triage_config.json").read_text(encoding="utf-8"))
 except Exception:
@@ -545,7 +547,7 @@ async def handle_event(client, st, topic, ev):
 def _unwrap(ev: dict, body: str) -> dict:
     """把 message 字段还原成 ``{"title", "message", ...}``。绝不抛。
 
-    实测两个发布方（notification_listener / wechat_vision_listener）发的
+    实测两个发布方（notification_listener / vision_listener）发的
     message 都是**纯文本**，所以绝大多数消息走的是最后那个兜底分支；JSON
     分支目前是给「发布方哪天改发 JSON」留的活口，不是线上主路径。
     解析不出来（不是 JSON、或压根不是字符串）一律退回原文兜底。

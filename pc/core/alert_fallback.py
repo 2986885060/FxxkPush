@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pclog
 
-HERE = Path(__file__).parent       # pc/
+HERE = Path(__file__).resolve().parents[1]  # pc/（本文件在 pc/core/）
 ECHO_FILE = HERE / "toast_echo.jsonl"
 
 

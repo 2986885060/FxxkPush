@@ -2,7 +2,7 @@
 chcp 65001 >nul
 REM FxxkPush: restart all PC services.
 REM
-REM The real logic is in pc\start_services.py — it does the ordering and the
+REM The real logic is in pc\bootstrap\start_services.py — it does the ordering and the
 REM health gate this script used to fake with `timeout /t 3`:
 REM   kill ours -> start tunnel -> poll /v1/health until 200 -> only then
 REM   start the rest -> verify every script has shim+worker = 2 processes.
@@ -15,7 +15,7 @@ REM pc\logs\start_services.log via pclog.
 set "PY=C:\Users\omo\fuckpush\.venv\Scripts\python.exe"
 set "PC=C:\Users\omo\fuckpush\pc"
 
-"%PY%" "%PC%\start_services.py"
+"%PY%" "%PC%\bootstrap\start_services.py"
 set RC=%ERRORLEVEL%
 
 echo.

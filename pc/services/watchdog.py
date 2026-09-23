@@ -34,7 +34,7 @@ from pathlib import Path
 
 import httpx
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parents[1]  # pc/（本文件在 pc/services/）
 NTFY_BASE = "http://127.0.0.1:2586"
 HEALTH_URL = f"{NTFY_BASE}/v1/health"
 LOG_DIR = HERE / "logs"
@@ -51,7 +51,7 @@ WATCHED = [                # 被监控的 5 个服务（watchdog 不监控自己
     "pc_subscriber.py",
     "notification_listener.py",
     "ai_triager.py",
-    "wechat_vision_listener.py",
+    "vision_listener.py",
 ]
 
 PYW = HERE.parent / ".venv" / "Scripts" / "pythonw.exe"   # 和 start_services 同一个
@@ -82,7 +82,7 @@ LOG_STEM = {
     "pc_subscriber.py": "pc_subscriber",
     "notification_listener.py": "notification_listener",
     "ai_triager.py": "ai_triager",
-    "wechat_vision_listener.py": "wechat_vision",
+    "vision_listener.py": "wechat_vision",
 }
 LINK_LOGS = [LOG_STEM[s] for s in WATCHED]   # check_link 要扫的全部日志
 
@@ -117,6 +117,8 @@ def _debug_hint(name: str, detail: str) -> str:
     return CHECK_DEBUG.get(name, "pc/logs/watchdog.log")
 
 
+sys.path[:0] = [str(Path(__file__).resolve().parents[1]),            # pc/
+                str(Path(__file__).resolve().parents[1] / "core")]   # 公共件 pclog/fp_feedback/alert_fallback
 import pclog
 from alert_fallback import push_vps, push_toast   # P2-5：2/3 层与 listener 共用
 LOG = pclog.get_logger("watchdog")
@@ -263,7 +265,7 @@ def revive_dead(now: float, last_revive: dict) -> None:
         last_revive[svc] = now
         try:
             subprocess.Popen(
-                [str(PYW), str(HERE / svc)], cwd=str(HERE),
+                [str(PYW), str(HERE / "services" / svc)], cwd=str(HERE),
                 creationflags=(getattr(subprocess, "DETACHED_PROCESS", 0)
                                | getattr(subprocess, "CREATE_NO_WINDOW", 0)))
             LOG.warning(f"revive: {svc} 计数 0 且日志静默，已拉起"

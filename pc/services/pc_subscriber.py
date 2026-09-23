@@ -19,7 +19,7 @@ import httpx
 
 # ---------- config ----------
 NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
-_SECRET = Path(__file__).parent / "ntfy.secret"
+_SECRET = Path(__file__).resolve().parents[1] / "ntfy.secret"
 try:
     NTFY_TOKEN = os.environ.get("FP_NTFY_TOKEN") or (
         _SECRET.read_text().strip() if _SECRET.exists() else "")
@@ -28,6 +28,8 @@ except Exception:
     NTFY_TOKEN = ""
 TOPICS = ["fp-vps", "fp-gray"]  # VPS hard alerts + gray-zone events
 
+sys.path[:0] = [str(Path(__file__).resolve().parents[1]),            # pc/
+                str(Path(__file__).resolve().parents[1] / "core")]   # 公共件 pclog/fp_feedback/alert_fallback
 import pclog
 LOG = pclog.get_logger("pc_subscriber")
 
@@ -64,7 +66,7 @@ def get_toaster():
         _toaster = Notification
     return _toaster
 
-ECHO = Path(__file__).parent / "toast_echo.jsonl"
+ECHO = Path(__file__).resolve().parents[1] / "toast_echo.jsonl"
 
 
 def record_echo(title, message):
