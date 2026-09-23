@@ -17,13 +17,13 @@
 VPS 日志（OOM/磁盘>90%/SSH 登录/服务挂掉）
   ├─ 硬规则 → ntfy(fp-vps) ──────────────┐
   └─ 灰区事件 → ntfy(fp-gray) ───────────┤
-                                         ├→ PC: ai_triager (MiMo v2.5)
+                                         ├→ PC: ai_triager (云端/本地OCR模型)
 Windows toast 通知（QQ/钉钉/学习通等）    │     ├─ 重要 → ntfy(fp-phone) → 手机/手表
   └─ notification_listener → ntfy(fp-pc)┘     └─ 忽略 → 静默归档 JSONL
                                          │
 微信 + 企业微信（自绘UI，无系统通知）      │
   └─ vision_listener ───────────────────┘
-     （窗口藏屏外 + 定时截图 → MiMo 视觉分诊）
+     （窗口藏屏外 + 定时截图 → 云端/本地OCR模型视觉分诊）
 
 PC 侧所有服务 → http://127.0.0.1:2586 → (pc/services/ntfy_tunnel.py 走 SSH) → VPS ntfy:2586
                                                         ↑
@@ -63,7 +63,7 @@ pc/
 | 来源 | 方式 | 实时性 |
 |---|---|---|
 | QQ / 钉钉 / 学习通等（走 Windows toast 的 App） | UserNotificationListener 抓系统通知 | 秒级实时 |
-| 微信 / 企业微信（自绘 UI，不走系统通知） | 窗口藏屏外，定时 PrintWindow 截图 → MiMo 视觉识别 | 30 分钟轮询 |
+| 微信 / 企业微信（自绘 UI，不走系统通知） | 窗口藏屏外，定时 PrintWindow 截图 → 云端/本地OCR模型视觉识别 | 30 分钟轮询 |
 | VPS 日志 | journalctl 采集 + 硬规则 grep 判级 | 60 秒巡检 |
 
 微信/企业微信的视觉方案说明：这两个 App 的通知是自绘的、不走 Windows 通知中心，UIA 控件树也是黑盒。本项目的解法是把主窗口挪到屏幕外（保持可见不最小化），定时用 PrintWindow 离屏截图发给视觉模型识别——**全程无鼠标劫持、不挡屏幕、不影响操作电脑**。
@@ -72,7 +72,7 @@ pc/
 
 1. **必推（硬规则，不过 AI、不去重）**：消息含 `@所有人` / `@我` / `@全体成员`；内容含 `text`（测试通道）
    > 硬规则在**通往手机的那道闸门**（`ai_triager`）上执行。上游采集器（视觉监听）虽然也会标记 @提及，但如果只在采集器里标记，下游 AI 仍可能以"群聊闲聊"为由把它压掉——实测踩过这个坑。
-2. **AI 判定**（MiMo v2.5）：家人/紧急联系人来信、日程提醒、账户安全、服务异常需要处理
+2. **AI 判定**（云端/本地OCR模型）：家人/紧急联系人来信、日程提醒、账户安全、服务异常需要处理
 3. **黑名单**（无条件忽略）：微信支付、公众号、服务通知、学校新闻、失物招领等系统号
 4. AI 调用失败时默认按重要推送（宁滥勿缺）
 5. 附带 30 分钟滑动窗口去重（同类事件只报一次+计数）
@@ -156,10 +156,10 @@ vps.secret              # 一行：host port user password（隧道与 vps_exec.
 pc/ntfy.secret          # 一行：ntfy token（tk_xxx）
 pc/triage_config.json   # AI 配置，示例：
 {
-  "provider": "mimo",
-  "base_url": "OCR模型端点",
+  "provider": "云端/本地OCR",
+  "base_url": "云端/本地OCR模型端点",
   "api_key": "sk-你的key",
-  "model": "任意OCR模型",
+  "model": "云端/本地OCR模型",
   "wechat_poll_min": 30,
   "wechat_my_name": "你的微信昵称",
   "dedup_window_sec": 1800,
@@ -226,7 +226,7 @@ curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0
 | `deploy/ntfy-server.yml` | VPS | ntfy 服务端配置（token 鉴权，deny-all） |
 | `pc/services/ntfy_tunnel.py` | PC (自启) | SSH 本地转发：`127.0.0.1:2586` → VPS ntfy，绕开端口封锁，断线自愈 |
 | `pc/services/notification_listener.py` | PC (自启) | UserNotificationListener 抓 toast → fp-pc + JSONL 归档 |
-| `pc/services/vision_listener.py` | PC (自启) | 微信/企业微信窗口藏屏外 → 定时截图 → MiMo 视觉分诊 |
+| `pc/services/vision_listener.py` | PC (自启) | 微信/企业微信窗口藏屏外 → 定时截图 → 云端/本地OCR模型视觉分诊 |
 | `pc/services/pc_subscriber.py` | PC (自启) | 订阅 fp-vps/fp-gray，弹 Windows toast |
 | `pc/services/ai_triager.py` | PC (自启) | 消费 fp-pc/fp-gray/fp-vps/fp-feedback → AI 分诊 → fp-phone / 静默，反馈经 `fp_feedback` 改写规则 |
 | `pc/core/fp_feedback.py` | PC (由 ai_triager 调用) | 误判反馈闭环：👍/👎 按钮构造、反馈落盘（自带 content 快照 = 微调语料）、源级规则状态机（3 次👎→静默跳过 AI，👍 可撤销） |
