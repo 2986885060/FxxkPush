@@ -247,14 +247,14 @@ curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0
 
 ```bash
 # 列出所有规则（含计数、是否 manual）
-.venv\Scripts\python.exe pc\fp_feedback.py list
+.venv\Scripts\python.exe pc\core\fp_feedback.py list
 
 # 手动静音 / 解除。manual 静音不会被👍 自动撤销，只能这样解
-.venv\Scripts\python.exe pc\fp_feedback.py mute   某应用
-.venv\Scripts\python.exe pc\fp_feedback.py unmute 某应用   # 会清零误判计数
+.venv\Scripts\python.exe pc\core\fp_feedback.py mute   某应用
+.venv\Scripts\python.exe pc\core\fp_feedback.py unmute 某应用   # 会清零误判计数
 
 # 近 24h 反馈统计
-.venv\Scripts\python.exe pc\fp_feedback.py stats
+.venv\Scripts\python.exe pc\core\fp_feedback.py stats
 ```
 
 **作用域只覆盖 Windows 通知（`fp-pc`）**，按钮和闸门都是。原因：`fp-vps`
