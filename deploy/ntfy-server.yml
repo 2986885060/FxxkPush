@@ -14,7 +14,10 @@ attachment-expiry-duration: "3h"
 # Logging
 log-level: INFO
 # set to your VPS public URL (used in push message links)
-base-url: "http://YOUR_VPS_IP:2586"
+base-url: "http://你的服务器IP:2586"
+
+# token auth (deny-all default; users get access tokens)
+auth: enable
 
 # Default: deny all, then allow subscribe for authenticated users.
 # We'll use access tokens per topic.

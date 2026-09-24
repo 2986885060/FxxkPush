@@ -39,7 +39,7 @@ CHECK_INTERVAL = 60          # main loop, seconds
 HB_INTERVAL = 300            # heartbeat every 5 min (PC watchdog judges by age)
 DISK_THRESHOLD = 90          # percent
 
-UNITS_TO_WATCH = ["s-ui", "maddy", "nginx", "ntfy"]
+UNITS_TO_WATCH = ["maddy", "ntfy", "caddy"]
 
 # ---------- state / dedup ----------
 _state = {"cooldowns": {}, "counts": {}}
