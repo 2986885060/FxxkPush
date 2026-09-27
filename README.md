@@ -80,7 +80,7 @@ pc/
 1. **必推（硬规则，不过 AI、不去重）**：消息含 `@所有人` / `@我` / `@全体成员`；内容含 `text`（测试通道）
    > 硬规则在**通往手机的那道闸门**（`ai_triager`）上执行。上游采集器（视觉监听）虽然也会标记 @提及，但如果只在采集器里标记，下游 AI 仍可能以"群聊闲聊"为由把它压掉——实测踩过这个坑。
 2. **AI 判定**（云端/本地OCR模型）：家人/紧急联系人来信、日程提醒、账户安全、服务异常需要处理
-3. **黑名单**（无条件忽略）：微信支付、公众号、服务通知、学校新闻、失物招领等系统号
+3. **黑名单**（无条件忽略，声明于 fp.config.json 的 `apps` 块）：微信支付、公众号、服务通知、学校新闻、失物招领等系统号
 4. AI 调用失败时默认按重要推送（宁滥勿缺）
 5. 附带 30 分钟滑动窗口去重（同类事件只报一次+计数）
 
@@ -171,20 +171,27 @@ uv pip install --python .venv httpx winotify paramiko winrt-runtime `
   "vision": {
     "settings": { "poll_min": 30, "my_name": "你的昵称",
                   "active_from": 8, "active_to": 24,
-                  "dedup_ttl_sec": 21600, "offscreen_offset": 120,
-                  "ignore_chats": ["公众号"] },
+                  "dedup_ttl_sec": 21600, "offscreen_offset": 120 },
     "wechat": { "process": "Weixin.exe", "class": "Qt51514",
                 "title": null, "min_w": 400, "label": "微信",
                 "prompt_hint": "左侧为会话列表，红色气泡为未读" },
     "qq":     { "process": "QQ.exe", "min_w": 400, "label": "QQ",
                 "prompt_hint": "左侧为会话列表，红色气泡为未读" }
+  },
+  "apps": {
+    "_default": { "ignore": false, "prompt_hint": "", "must_push": [],
+                  "blacklist": ["微信支付", "公众号", "服务通知"] },
+    "QQ": { "must_push": ["取件码"] }
   }
 }
 ```
 
-四段信息各归其位：① `ai` = 三处分诊共用的 OCR 端点与分诊参数 ②
+五段信息各归其位：① `ai` = 三处分诊共用的 OCR 端点与分诊参数 ②
 `ntfy.token` = ntfy token ③ `vps` = SSH 四段凭据 ④ `vision` = 窗口清单 +
-视觉运行参数。（历史版本中的四份旧配置文件已删除，内容全部并入本文件。）
+视觉运行参数 ⑤ `apps` = 按来源声明分诊规则（`ignore` 静默 / `blacklist`
+黑名单 / `must_push` 必推词 / `prompt_hint` 提示词补充）—— 新软件接入
+只需在 `apps` 加一个条目，不必改代码。（历史版本中的四份旧配置文件已
+删除，内容全部并入本文件。）
 
 ### 4. PC：启动与自启
 
@@ -286,7 +293,7 @@ curl.exe -H "Authorization: Bearer $((Get-Content fp.config.json -Raw -Encoding 
 
 | 文件 | 内容 |
 |---|---|
-| `fp.config.json` | **PC 侧唯一配置**（读取器 `pc/core/fpconfig.py`）：`ai` = OCR 端点与分诊参数（三处分诊共用）、`ntfy.token` = ntfy token、`vps` = SSH 四段凭据、`vision` = 窗口清单（process→class→title 三层匹配，条目支持 enabled/poll_min/prompt）+ 视觉运行参数（轮询/昵称/时段/去重/忽略名单）。支持 // 注释，填表助手 `vision_listener.py list` |
+| `fp.config.json` | **PC 侧唯一配置**（读取器 `pc/core/fpconfig.py`）：`ai` = OCR 端点与分诊参数（三处分诊共用）、`ntfy.token` = ntfy token、`vps` = SSH 四段凭据、`vision` = 窗口清单（process→class→title 三层匹配）+ 视觉运行参数、`apps` = 按来源声明 ignore/blacklist/must_push/prompt_hint（自定义软件接入，闸门与视觉双通道消费）。支持 // 注释，填表助手 `vision_listener.py list` |
 
 > 历史版本中的 `vps.secret` / `pc/ntfy.secret` / `pc/triage_config.json` /
 > `pc/vision_targets.json` 已删除（内容全部并入 `fp.config.json`）。
@@ -323,6 +330,6 @@ curl.exe -H "Authorization: Bearer $((Get-Content fp.config.json -Raw -Encoding 
 - [ ] 反馈的「该推没推」信号（当前只有👎 能点，被静默的消息手机上没有按钮）
 - [ ] WebSocket 订阅 + PWA 界面
 - [ ] ntfy for Android 界面重写与美化：官方客户端功能够用但界面糙（列表、主题、排版都谈不上好看），按本项目的分诊语义自绘客户端 —— 来源分组、优先级着色、误判可就地纠正
-- [ ] 自定义软件接入：接入层配置化，新软件用声明式配置即可纳入分诊，不必逐个写死适配代码
+- [x] 自定义软件接入：接入层配置化，新软件用声明式配置即可纳入分诊，不必逐个写死适配代码（已实现：`apps` 块声明规则 + vision 窗口条目，闸门与视觉双通道消费）
 - [ ] 可操作 UI：推送从「只能看」升级到「能点」—— 通知内直接给动作（已读回执 / 静音该来源 / 稍后提醒 / 重推），动作回传 PC 执行
 - [ ] Go 重写（性能瓶颈出现后）

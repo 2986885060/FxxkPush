@@ -3,10 +3,12 @@
 
 配置读取自仓库根 fp.config.json（全项目唯一真实来源，经 pc/core/fpconfig.py）：
   - ai 块：OCR 端点（base_url / api_key / model，与 ai_triager 分诊共用）
-  - vision 块：settings 运行参数（轮询 / @我昵称 / 活跃时段 / 去重 / 忽略
-    名单 / 屏外偏移）+ 窗口条目 —— process（PID→exe，必填）→ class（子串，
-    可选）→ title（正则，可选）三层匹配，同条件取面积最大的主窗口；条目
-    可带 enabled（开关）/ poll_min（独立轮询）/ prompt（整段提示词覆盖）
+  - vision 块：settings 运行参数（轮询 / @我昵称 / 活跃时段 / 去重 / 屏外
+    偏移）+ 窗口条目 —— process（PID→exe，必填）→ class（子串，可选）→
+    title（正则，可选）三层匹配，同条件取面积最大的主窗口；条目可带
+    enabled（开关）/ poll_min（独立轮询）/ prompt（整段提示词覆盖）
+  - apps 块：按来源声明分诊规则（ignore / blacklist / must_push /
+    prompt_hint），与闸门 ai_triager 消费同一份声明
 
 被监控的窗口会被挪到屏幕外（保持可见、不最小化），每 POLL 分钟
 PrintWindow 截图发给云端/本地OCR模型识别。
@@ -63,9 +65,9 @@ def _auth() -> dict:
     return {"Authorization": f"Bearer {NTFY_TOKEN}"} if NTFY_TOKEN else {}
 ARCHIVE = HERE / "vision_log.jsonl"
 SEEN_STATE = HERE / "vision_state.json"
-# SEEN_TTL / POLL_MIN / ACTIVE_* / MY_NAME / OFFSCREEN_X_OFFSET / IGNORE_CHATS
+# SEEN_TTL / POLL_MIN / ACTIVE_* / MY_NAME / OFFSCREEN_X_OFFSET
 # 全部从 fp.config.json vision 块的 settings 派生（见下方 TARGETS），
-# 不再写死在这里、也不再读 triage_config.json 的任何键。
+# 不再写死在这里；忽略/黑名单统一走 apps 块（fpconfig.rules_for）。
 
 USER32 = ctypes.windll.user32
 GDI32 = ctypes.windll.gdi32
@@ -119,9 +121,8 @@ ACTIVE_FROM = int(SETTINGS.get("active_from", 8))         # 活跃时段起（�
 ACTIVE_TO = int(SETTINGS.get("active_to", 24))            # 活跃时段止（不含）
 SEEN_TTL = int(SETTINGS.get("dedup_ttl_sec", 6 * 3600))   # 同一未读去重窗口
 OFFSCREEN_X_OFFSET = int(SETTINGS.get("offscreen_offset", 120))
-IGNORE_CHATS = set(SETTINGS.get("ignore_chats", [
-    "微信支付", "公众号", "服务通知", "QQ邮箱提醒", "折叠的聊天",
-    "应用提醒", "失物招领&寻物启事"]))
+# 忽略/黑名单不在此派生：handle() 运行时经 fpconfig.rules_for(label) 读
+# apps 块 —— 与闸门 ai_triager 消费同一份声明（单一配置，无第二份名单）。
 
 # OCR/视觉模型接口已在文件顶部取好（AI = fpconfig.ai()，fp.config.json 单一
 # 来源，与 ai_triager 共用），这里不再合并第二份。
@@ -497,6 +498,13 @@ def scan_app(key: str, spec: dict) -> tuple[str, dict | None]:
 def handle(result: dict):
     app = result.get("_app", "?")
     label = result.get("_label", app)
+    # 声明式来源规则（apps 块）：ignore = 整源跳过；blacklist = 会话级忽略。
+    # 与闸门 ai_triager 消费同一份声明（fpconfig.rules_for），单一配置。
+    rules = fpconfig.rules_for(label)
+    if rules.get("ignore"):
+        log(f"[{app}] apps 声明 ignore，跳过本条")
+        return
+    ign = set(rules.get("blacklist") or [])
     unread = result.get("unread", [])
     important = result.get("important", [])
     archive({"ts": time.time(), "app": app, "unread": unread,
@@ -504,11 +512,11 @@ def handle(result: dict):
     log(f"[{app}] {len(unread)} unread chats, {len(important)} important")
 
     # merge AI's important list with our hard rules (@所有人/@我/text直推)
-    flagged = {i.get("chat"): i for i in important if i.get("chat") not in IGNORE_CHATS}
+    flagged = {i.get("chat"): i for i in important if i.get("chat") not in ign}
     for u in unread:
         chat = u.get("chat", "")
         preview = u.get("preview", "")
-        if chat in flagged or chat in IGNORE_CHATS:
+        if chat in flagged or chat in ign:
             continue
         if "text" in preview.lower():
             flagged[chat] = {"chat": chat, "reason": "测试直推"}

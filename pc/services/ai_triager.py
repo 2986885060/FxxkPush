@@ -252,11 +252,13 @@ def save_state(st):
             pass
 
 
-async def classify(client: httpx.AsyncClient, kind: str, content: str) -> dict:
+async def classify(client: httpx.AsyncClient, kind: str, content: str,
+                   extra: str = "") -> dict:
     payload = {
         "model": CONFIG["model"],
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system",
+             "content": SYSTEM_PROMPT + (f"\n\n{extra}" if extra else "")},
             {"role": "user", "content": f"[{kind}] {content}"},
         ],
         "max_completion_tokens": CONFIG["max_tokens"],
@@ -388,6 +390,39 @@ async def handle_event(client, st, topic, ev):
         src = topic
         content = (title + "\n" + body).strip() if body else title
 
+    # TEST RULE: anything containing "text" always goes straight to the
+    # phone (bypasses AI + dedup) so users can test the pipe anytime.
+    # 放最前：声明式规则与硬规则谁都不能压住排障通道。
+    if "text" in content.lower():
+        archive({"ts": time.time(), "topic": topic, "src": src,
+                 "content": content, "label": "测试直推"})
+        ok = await push_phone(client, f"[测试] {src}", content[:200])
+        log(f"TEST_PUSH {'ok' if ok else 'FAIL'} [{src}] {content[:50]}")
+        return
+
+    # 声明式来源规则（fp.config.json 的 apps 块，fpconfig.rules_for）——
+    # 自定义软件接入的核心：新来源只在配置里声明 ignore / blacklist /
+    # must_push / prompt_hint，不必改代码。只作用于 fp-pc（与 fp_feedback
+    # 静音同样的保护：其它 topic 的 src 恒为通道名，_default 误伤会把服务器
+    # 告警整条掐掉）。语义次序：声明忽略/黑名单是用户显式配置，压过 @ 提及；
+    # must_push 与 @ 提及同为硬规则（绕过 AI + dedup）。
+    rules = fpconfig.rules_for(src) if topic == "fp-pc" else {}
+    if rules.get("ignore"):
+        archive({"ts": time.time(), "topic": topic, "src": src,
+                 "content": content, "label": "声明忽略",
+                 "reason": f"apps[{src}].ignore=true"})
+        log(f"app-ignored [{src}] {content[:50]}")
+        return
+    probe = f"{title}\n{content}"
+    bl_hit = next((b for b in (rules.get("blacklist") or [])
+                   if b and b in probe), None)
+    if bl_hit:
+        archive({"ts": time.time(), "topic": topic, "src": src,
+                 "content": content, "label": "来源黑名单",
+                 "reason": f"apps[{src}] blacklist 命中[{bl_hit}]"})
+        log(f"blacklisted [{src}] hit={bl_hit} | {content[:50]}")
+        return
+
     # HARD RULE: @所有人 / @我 always push (bypasses AI + dedup). The vision
     # listener flags these too, but the triager is the gate to the phone — if
     # it does not enforce them here, its "群聊闲聊" verdict would silence a
@@ -399,13 +434,16 @@ async def handle_event(client, st, topic, ev):
         log(f"MENTION_PUSH {'ok' if ok else 'FAIL'} [{src}] {content[:50]}")
         return
 
-    # TEST RULE: anything containing "text" always goes straight to the
-    # phone (bypasses AI + dedup) so users can test the pipe anytime.
-    if "text" in content.lower():
+    # 声明式必推词：命中即推（与 @提及 同级硬规则，绕过 AI + dedup）
+    low = probe.lower()
+    mp_hit = next((w for w in (rules.get("must_push") or [])
+                   if w and w.lower() in low), None)
+    if mp_hit:
         archive({"ts": time.time(), "topic": topic, "src": src,
-                 "content": content, "label": "测试直推"})
-        ok = await push_phone(client, f"[测试] {src}", content[:200])
-        log(f"TEST_PUSH {'ok' if ok else 'FAIL'} [{src}] {content[:50]}")
+                 "content": content, "label": "重要",
+                 "reason": f"必推词[{mp_hit}]"})
+        ok = await push_phone(client, f"[规则] {src}", content[:200])
+        log(f"RULE_PUSH {'ok' if ok else 'FAIL'} [{src}] hit={mp_hit} | {content[:50]}")
         return
 
     # P2-6: fp-vps 是硬规则通道 —— vps_monitor 的 docstring 承诺「直接推
@@ -452,8 +490,11 @@ async def handle_event(client, st, topic, ev):
         log(f"rule-silenced [{src}] {content[:50]}")
         return
 
+    hint = str(rules.get("prompt_hint") or "")
     try:
-        verdict = await classify(client, kind, content)
+        verdict = await classify(
+            client, kind, content,
+            extra=f"来源[{src}]的补充说明：{hint}" if hint else "")
         if not isinstance(verdict, dict):
             # 模型完全可能返回合法 JSON 但不是对象（["重要"] / "重要" /
             # null —— classify 自己就在处理模型不守 fence，说明这类偏移真实

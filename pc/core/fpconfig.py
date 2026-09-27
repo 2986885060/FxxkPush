@@ -176,3 +176,48 @@ def vision() -> tuple[dict, dict, list[str]]:
     if not targets:
         problems.append("vision 里没有启用的目标")
     return settings, targets, problems
+
+
+APPS_DEFAULT = {
+    "ignore": False,        # true = 该来源整段静默（不问 AI 不推送）
+    "blacklist": [],        # 会话/标题黑名单：命中即静默归档
+    "must_push": [],        # 必推词（不区分大小写子串）：命中走硬规则直推
+    "prompt_hint": "",      # 追加到分诊系统提示的该来源补充说明
+}
+
+
+def _apps_norm(rules: dict) -> dict:
+    """把合并结果收敛成固定形状，防手改配置的类型漂移。"""
+    rules["ignore"] = bool(rules.get("ignore"))
+    for k in ("blacklist", "must_push"):
+        v = rules.get(k)
+        rules[k] = [str(x) for x in v if x] if isinstance(v, list) else []
+    rules["prompt_hint"] = str(rules.get("prompt_hint") or "")
+    return rules
+
+
+def rules_for(src: str) -> dict:
+    """⑤ 按来源解析声明式规则（fp.config.json 的 apps 块）——自定义软件
+    接入的核心：新来源只需声明 ignore / blacklist / must_push / prompt_hint。
+
+    条目 key 或其 ``match`` 列表命中 src → 与 ``_default`` 浅合并返回；
+    未命中返回 ``_default``。返回值供只读消费。
+    """
+    data = raw().get("apps")          # 注意别写成 raw = raw()：局部绑定会
+    if not isinstance(data, dict):     # 让下面的 raw() 变成 UnboundLocalError
+        return dict(APPS_DEFAULT)
+    default = dict(APPS_DEFAULT)
+    base = data.get("_default")
+    if isinstance(base, dict):
+        default.update(base)
+    default = _apps_norm(default)
+    for key, spec in data.items():
+        if key == "_default" or not isinstance(spec, dict):
+            continue
+        aliases = spec.get("match")
+        hit = (src == key) or (isinstance(aliases, list) and src in aliases)
+        if hit:
+            merged = dict(default)
+            merged.update(spec)
+            return _apps_norm(merged)
+    return default
