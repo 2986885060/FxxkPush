@@ -1,10 +1,9 @@
 *.secret
-pc/triage_config.json
 __pycache__/
 *.pyc
 .venv/
 *.log
-ntfy.secret
+fp.config.json
 pc/listener_state.json
 pc/notifications.jsonl
 pc/triage_log.jsonl

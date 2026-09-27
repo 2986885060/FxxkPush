@@ -118,16 +118,16 @@ def _debug_hint(name: str, detail: str) -> str:
 
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]),            # pc/
-                str(Path(__file__).resolve().parents[1] / "core")]   # 公共件 pclog/fp_feedback/alert_fallback
+                str(Path(__file__).resolve().parents[1] / "core")]   # 公共件 pclog/fpconfig/fp_feedback/alert_fallback
 import pclog
+import fpconfig
 from alert_fallback import push_vps, push_toast   # P2-5：2/3 层与 listener 共用
 LOG = pclog.get_logger("watchdog")
 
 
 # ---------------------------------------------------------------- 检查项
 def _token() -> str:
-    p = HERE / "ntfy.secret"
-    return p.read_text().strip() if p.exists() else ""
+    return fpconfig.ntfy_token()   # 非空才缓存，空则下次重读（AV 抖动自愈）
 
 
 _health_client: httpx.Client | None = None
@@ -408,7 +408,7 @@ def check_vps() -> tuple[bool, str]:
     """VPS 监控存活（反向心跳，B 方案）：VPS 每 HB_INTERVAL 秒发一条到
     fp-vps-hb，这里只经本地隧道拉最近事件算年龄 —— 零新建 SSH 连接。
 
-    为什么替换主动 SSH：PC 开 TUN/系统代理时，到 VPS 的 SSH 端口 的**新建**
+    为什么替换主动 SSH：PC 开 TUN/系统代理时，到 VPS 的 SSH 端口的**新建**
     SSH 握手被代理链路间歇吞掉（2026-09-23 实测三轮 10-26 分钟假告警，
     服务端 sshd 无罪、已建立的长连接不受影响），而本检查走
     127.0.0.1:2586 是隧道内 HTTP，不产生任何新外部连接。

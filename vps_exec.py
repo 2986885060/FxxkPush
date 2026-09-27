@@ -6,7 +6,8 @@ Usage:
     python vps_exec.py --put local remote     # upload a file
     python vps_exec.py --get remote local     # download a file
 
-Credentials come from vps.secret next to this file (never committed to git).
+Credentials come from fp.config.json (vps block) via pc/core/fpconfig.py ——
+the same single config the PC services read (never committed to git).
 """
 import sys
 import os
@@ -17,14 +18,15 @@ from pathlib import Path
 import paramiko
 
 HERE = Path(__file__).resolve().parent
-SECRET = HERE / "vps.secret"
+sys.path.insert(0, str(HERE / "pc" / "core"))
+import fpconfig
 
 
 def load_secret():
-    parts = SECRET.read_text().strip().split()
-    if len(parts) != 4:
-        raise SystemExit("vps.secret must be: host port user password")
-    return parts
+    try:
+        return list(fpconfig.vps())          # (host, port, user, password)
+    except ValueError as e:
+        raise SystemExit(str(e))             # 缺配置：给出人能看懂的一句话
 
 
 def connect():

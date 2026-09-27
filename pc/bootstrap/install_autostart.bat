@@ -14,8 +14,9 @@ REM no ntfy to talk to on networks that block the ntfy port.
 REM NOTE: watchdog.py is the pipeline self-check — it pushes a failure straight
 REM to the phone when something dies, so it must autostart too.
 
-set "PYW=C:\Users\user\fuckpush\.venv\Scripts\pythonw.exe"
-set "PC=C:\Users\user\fuckpush\pc"
+set "ROOT=%~dp0..\.."
+set "PYW=%ROOT%\.venv\Scripts\pythonw.exe"
+set "PC=%ROOT%\pc"
 set "RUN=HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 
 reg add "%RUN%" /v FuckPush_tunnel          /t REG_SZ /d "\"%PYW%\" \"%PC%\services\ntfy_tunnel.py\""             /f >nul

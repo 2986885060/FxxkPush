@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 import pclog
+import fpconfig
 
 HERE = Path(__file__).resolve().parents[1]  # pc/（本文件在 pc/core/）
 ECHO_FILE = HERE / "toast_echo.jsonl"
@@ -34,8 +35,7 @@ def _cut(s: str, n: int) -> str:
 
 
 def _token() -> str:
-    p = HERE / "ntfy.secret"
-    return p.read_text().strip() if p.exists() else ""
+    return fpconfig.ntfy_token()   # 非空才缓存，空则下次重读（AV 抖动自愈）
 
 
 def push_vps(payload: dict, log) -> bool:
@@ -44,20 +44,16 @@ def push_vps(payload: dict, log) -> bool:
     payload 走 base64：JSON 里有中文和引号，塞进 shell 命令会被转义啃掉，
     base64 全 ASCII 就没这问题；VPS 端用 curl -d @file 读，零转义。
     """
-    # r8 P1-2：secret 解包 / import paramiko / SSHClient 构造原来在 try
-    # **之外** —— vps.secret 被改坏（字段数≠4 抛 ValueError）、AV 瞬间拒读
-    # （OSError）、paramiko 导入失败，且同时本地隧道不可用（正是要走第二层
-    # 的时刻）时，异常沿 push_vps → send_alert → main 冒出，excepthook 再
-    # 调 send_alert 撞同一异常被 except 吞掉，**第三层 toast 根本没机会
-    # 执行** → watchdog os._exit，监控整体停摆 —— 复刻 17:21「最该报警时
-    # 一条都没送出去」。全部收进 try。
+    # r8 P1-2：vps 凭据解包 / import paramiko / SSHClient 构造原来在 try
+    # **之外** —— fp.config.json 的 vps 块缺失/字段空（fpconfig.vps 抛
+    # ValueError）、AV 瞬间拒读（OSError）、paramiko 导入失败，且同时本地
+    # 隧道不可用（正是要走第二层的时刻）时，异常沿 push_vps → send_alert →
+    # main 冒出，excepthook 再调 send_alert 撞同一异常被 except 吞掉，
+    # **第三层 toast 根本没机会执行** → watchdog os._exit，监控整体停摆
+    # —— 复刻 17:21「最该报警时一条都没送出去」。全部收进 try。
     cli = None
     try:
-        secret = HERE.parent / "vps.secret"
-        if not secret.exists():
-            log.error("vps.secret 不存在，无法走 SSH 兜底")
-            return False
-        host, port, user, pwd = secret.read_text().split()
+        host, port, user, pwd = fpconfig.vps()   # 没配置抛 ValueError，被下面 except 接住留日志
         import paramiko
 
         cli = paramiko.SSHClient()

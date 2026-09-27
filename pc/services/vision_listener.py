@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""FxxkPush vision listener v0.6 — WeChat + WeCom (企业微信).
+"""FxxkPush vision listener — 配置驱动的窗口视觉分诊。
 
-Every POLL minutes, screenshots both apps' main windows (parked
-off-screen) and sends them to the cloud/local OCR model for triage.
+配置读取自仓库根 fp.config.json（全项目唯一真实来源，经 pc/core/fpconfig.py）：
+  - ai 块：OCR 端点（base_url / api_key / model，与 ai_triager 分诊共用）
+  - vision 块：settings 运行参数（轮询 / @我昵称 / 活跃时段 / 去重 / 忽略
+    名单 / 屏外偏移）+ 窗口条目 —— process（PID→exe，必填）→ class（子串，
+    可选）→ title（正则，可选）三层匹配，同条件取面积最大的主窗口；条目
+    可带 enabled（开关）/ poll_min（独立轮询）/ prompt（整段提示词覆盖）
+
+被监控的窗口会被挪到屏幕外（保持可见、不最小化），每 POLL 分钟
+PrintWindow 截图发给云端/本地OCR模型识别。
 
 Important rules (user-defined):
   - @所有人 or @我 in any chat  -> important
@@ -10,11 +17,17 @@ Important rules (user-defined):
   - everything else -> silent archive
 
 Schedule: active 08:00-23:59, quiet 00:00-07:59.
+
+用法：
+    python vision_listener.py          # 常驻监听
+    python vision_listener.py park     # 把配置的窗口挪到屏幕外（一次性）
+    python vision_listener.py list     # 列出可见窗口，帮你填 fp.config.json vision 块
 """
 import base64
 import os
 import ctypes
 import json
+import re
 import sys
 import time
 from ctypes import wintypes
@@ -22,24 +35,23 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
+import psutil
 
 HERE = Path(__file__).resolve().parents[1]  # pc/（本文件在 pc/services/）
 NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/services/ntfy_tunnel.py)
-try:
-    NTFY_TOKEN = ((HERE / "ntfy.secret").read_text().strip()
-                  if (HERE / "ntfy.secret").exists() else "")
-    CFG = json.loads((HERE / "triage_config.json").read_text(encoding="utf-8"))
-except Exception:
-    # 两个导入期读取都包进来：AV 独占 secret、或 triage_config.json 被手改
-    # 坏 —— 都发生在 excepthook 挂上之前，pythonw 下会无声退出（第 5 轮
-    # 同型问题，这是 4 处里的第 4 处）。CFG 给空 dict，下面全部用 .get 带
-    # 默认值，不会因此 KeyError。
-    NTFY_TOKEN = ""
-    CFG = {}
+
+sys.path[:0] = [str(HERE),                    # pc/
+                str(HERE / "core")]           # 公共件 pclog/fpconfig/fp_feedback/alert_fallback
+import fpconfig
+# 导入期读取的安全性由 fpconfig 保证：缺文件/坏块/AV 抖动一律降级成
+# ""/{}，绝不把 pythonw 打死在 excepthook 挂上之前（原先这里的 try 就是
+# 为这个场景准备的，现在收敛到 fpconfig 一处）。
+NTFY_TOKEN = fpconfig.ntfy_token()
+AI = fpconfig.ai()
 
 
 def _auth() -> dict:
-    """鉴权头。**空 token 时不带头** + 每次取不到都重试读文件。
+    """鉴权头。**空 token 时不带头** + 每次取不到都重试（fpconfig 非空才缓存）。
 
     空 ``Bearer `` 是非法头值 → httpx LocalProtocolError（TransportError，
     没有 .response）；不带头则服务端回 401，push() 的 except 接得住、
@@ -47,19 +59,13 @@ def _auth() -> dict:
     """
     global NTFY_TOKEN
     if not NTFY_TOKEN:
-        try:
-            p = HERE / "ntfy.secret"
-            NTFY_TOKEN = p.read_text().strip() if p.exists() else ""
-        except Exception:
-            return {}
+        NTFY_TOKEN = fpconfig.ntfy_token()
     return {"Authorization": f"Bearer {NTFY_TOKEN}"} if NTFY_TOKEN else {}
 ARCHIVE = HERE / "vision_log.jsonl"
 SEEN_STATE = HERE / "vision_state.json"
-SEEN_TTL = 6 * 3600  # don't re-report the same unread content for 6h
-POLL_MIN = CFG.get("wechat_poll_min", 30)
-ACTIVE_FROM, ACTIVE_TO = 8, 24
-OFFSCREEN_X_OFFSET = 120
-MY_NAME = CFG.get("wechat_my_name", "你的昵称")  # used to detect @我
+# SEEN_TTL / POLL_MIN / ACTIVE_* / MY_NAME / OFFSCREEN_X_OFFSET / IGNORE_CHATS
+# 全部从 fp.config.json vision 块的 settings 派生（见下方 TARGETS），
+# 不再写死在这里、也不再读 triage_config.json 的任何键。
 
 USER32 = ctypes.windll.user32
 GDI32 = ctypes.windll.gdi32
@@ -75,19 +81,13 @@ except Exception:
     except Exception:
         pass
 
-TARGETS = {
-    "wechat": {"class": "Qt51514", "title": None, "min_w": 400},
-    "wecom": {"class": "WeWorkWindow", "title": "企业微信", "min_w": 500},
-}
-
-# chats never pushed regardless of AI verdict (system/low-value noise)
-IGNORE_CHATS = {"微信支付", "公众号", "服务通知", "QQ邮箱提醒", "折叠的聊天",
-                "应用提醒", "失物招领&寻物启事"}
-
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]),            # pc/
                 str(Path(__file__).resolve().parents[1] / "core")]   # 公共件 pclog/fp_feedback/alert_fallback
 import pclog
+# 日志服务名沿用 "wechat_vision"：watchdog 的 quiet 阈值与「脚本名→日志名」
+# 映射（watchdog.py:75,85）、以及告警文案里的日志路径都认这个名字，
+# 改名要同步那三处，这里先不动。
 LOG = pclog.get_logger("wechat_vision")
 
 
@@ -102,6 +102,34 @@ def _log_crash(exc_type, exc, tb):
 
 
 sys.excepthook = _log_crash
+
+
+# 窗口清单 + 运行参数统一经 fpconfig 读 fp.config.json（注释剥离 / 校验 /
+# 启用过滤都在那边）；problems 交给这里的 logger —— 与原先 _load_targets
+# 的日志行为一致：没配置是显式一行日志，不是静默空转。
+# 注意 fpconfig.vision() 的返回顺序是 (settings, targets, problems)
+SETTINGS, TARGETS, _cfg_problems = fpconfig.vision()
+for _p in _cfg_problems:
+    log(_p)
+
+# ---- settings 块派生的运行参数（默认值 = 原先写死的常量，行为不变）----
+POLL_MIN = int(SETTINGS.get("poll_min", 30))              # 全局轮询间隔（分钟）
+MY_NAME = SETTINGS.get("my_name", "你的昵称")          # 「@我」判定昵称
+ACTIVE_FROM = int(SETTINGS.get("active_from", 8))         # 活跃时段起（含）
+ACTIVE_TO = int(SETTINGS.get("active_to", 24))            # 活跃时段止（不含）
+SEEN_TTL = int(SETTINGS.get("dedup_ttl_sec", 6 * 3600))   # 同一未读去重窗口
+OFFSCREEN_X_OFFSET = int(SETTINGS.get("offscreen_offset", 120))
+IGNORE_CHATS = set(SETTINGS.get("ignore_chats", [
+    "微信支付", "公众号", "服务通知", "QQ邮箱提醒", "折叠的聊天",
+    "应用提醒", "失物招领&寻物启事"]))
+
+# OCR/视觉模型接口已在文件顶部取好（AI = fpconfig.ai()，fp.config.json 单一
+# 来源，与 ai_triager 共用），这里不再合并第二份。
+
+# 睡眠间隔取「全局值与各目标 poll_min 的最小」——否则某目标配了更短间隔
+# 也不会真的更早醒来（醒来后由目标级到期判断决定扫谁）。
+POLL_SLEEP_MIN = min([POLL_MIN] + [int(t.get("poll_min") or POLL_MIN)
+                                    for t in TARGETS.values()])
 
 
 def _seen_load() -> dict:
@@ -146,27 +174,71 @@ def archive(rec):
         log(f"archive write failed: {e!r}")
 
 
-def find_window(cls_substr: str, title: str | None, min_w: int):
-    wins = []
+def _exe_of(pid: int, cache: dict) -> str:
+    """PID → exe 名（带缓存）。读不到（进程刚退/权限）得空串，等同不匹配。"""
+    if pid not in cache:
+        try:
+            cache[pid] = psutil.Process(pid).name()
+        except Exception:
+            cache[pid] = ""
+    return cache[pid]
+
+
+def find_target(spec: dict, min_w: int | None = None):
+    """按 fp.config.json vision 块的条目挑主窗口，返回 (hwnd, x, y, w, h) 或 None。
+
+    三层匹配：process（PID→exe，必填）→ class（子串，可选）→ title
+    （正则，可选）。同条件窗口按主窗口启发式挑：排除 WS_EX_TOOLWINDOW、
+    子窗/owned 窗、无标题窗，取面积最大者。min_w 用于「最小化」二次探测
+    （显式传 0 = 只要有窗就算）。
+    """
+    want_proc = (spec.get("process") or "").lower()
+    want_cls = spec.get("class")
+    want_title = spec.get("title")
+    limit = spec.get("min_w", 400) if min_w is None else min_w
+    rx = re.compile(want_title) if want_title else None
+    best = None
+    best_area = -1
+    pid_exe: dict[int, str] = {}
     CB = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 
     def cb(hwnd, lp):
-        c = ctypes.create_unicode_buffer(64)
-        USER32.GetClassNameW(hwnd, c, 64)
-        if cls_substr not in c.value:
+        nonlocal best, best_area
+        if not USER32.IsWindowVisible(hwnd):
             return True
-        t = ctypes.create_unicode_buffer(128)
-        USER32.GetWindowTextW(hwnd, t, 128)
-        if title and title not in t.value:
+        if USER32.GetWindowLongW(hwnd, -20) & 0x80:   # WS_EX_TOOLWINDOW
+            return True
+        if USER32.GetParent(hwnd):                    # 子窗 / owned 窗
+            return True
+        t = ctypes.create_unicode_buffer(256)
+        USER32.GetWindowTextW(hwnd, t, 256)
+        if not t.value:
+            return True
+        if want_proc:
+            pid = wintypes.DWORD()
+            USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if _exe_of(pid.value, pid_exe).lower() != want_proc:
+                return True
+        if want_cls:
+            c = ctypes.create_unicode_buffer(64)
+            USER32.GetClassNameW(hwnd, c, 64)
+            if want_cls not in c.value:
+                return True
+        if rx and not rx.search(t.value):
             return True
         r = wintypes.RECT()
         USER32.GetWindowRect(hwnd, ctypes.byref(r))
-        if (r.right - r.left) > min_w:
-            wins.append((hwnd, r.left, r.top, r.right - r.left, r.bottom - r.top))
+        w, h = r.right - r.left, r.bottom - r.top
+        if w <= limit:
+            return True
+        area = w * h
+        if area > best_area:
+            best_area = area
+            best = (hwnd, r.left, r.top, w, h)
         return True
 
     USER32.EnumWindows(CB(cb), 0)
-    return wins[0] if wins else None
+    return best
 
 
 def park_needed(hwnd) -> bool:
@@ -311,40 +383,43 @@ def _bgra_to_png_pure(bgra: bytes, w: int, h: int) -> bytes:
     return png
 
 
-VISION_PROMPT = f"""你是消息分诊助手，分析 PC 端聊天软件主窗口截图（左侧为会话列表）。
+def _prompt_for(label: str, hint: str) -> str:
+    """每个目标一条 prompt：label / prompt_hint 来自 vision 块，
+    界面长什么样由配置里那句 hint 告诉模型，不再写死微信的会话列表布局。"""
+    hint = hint or "识别界面上的未读提示（红点/数字徽标/加粗条目）"
+    return f"""你是消息分诊助手，分析 PC 端应用主窗口截图。
+应用：{label}。界面说明：{hint}
 
 任务：
-1. 找出左侧会话列表中所有有未读消息的聊天（红色数字徽标或加粗提示），记录：聊天名、未读数、预览文字
+1. 找出所有有未读提示的会话/条目（红色数字徽标或加粗），记录：名字、未读数、预览文字
 2. 特别注意消息预览中是否包含"@所有人"或"@{MY_NAME}"——这类消息必须标记为重要
 3. 其他判重要标准：家人/紧急联系人来信、日程提醒、账户安全、服务异常需要处理
 4. 群聊普通闲聊、营销、系统通知、转账回执 → 忽略
 
 只输出 JSON（不要多余文字）：
-{{"app": "<app>", "unread": [{{"chat": "名字", "count": 数字, "preview": "预览", "at_all": true/false, "at_me": true/false}}], "important": [{{"chat": "名字", "reason": "10字以内"}}]}}
-无未读时：{{"app": "<app>", "unread": [], "important": []}}"""
+{{"app": "{label}", "unread": [{{"chat": "名字", "count": 数字, "preview": "预览", "at_all": true/false, "at_me": true/false}}], "important": [{{"chat": "名字", "reason": "10字以内"}}]}}
+无未读时：{{"app": "{label}", "unread": [], "important": []}}"""
 
 
-
-
-def analyze(bgra, w, h, app: str) -> dict | None:
+def analyze(bgra, w, h, key: str, label: str, prompt: str) -> dict | None:
     png = bgra_to_png(bgra, w, h)
     b64 = base64.b64encode(png).decode()
     try:
         r = httpx.post(
-            CFG["base_url"].rstrip("/") + "/chat/completions",
-            headers={"Authorization": f"Bearer {CFG['api_key']}"},
+            AI["base_url"].rstrip("/") + "/chat/completions",
+            headers={"Authorization": f"Bearer {AI['api_key']}"},
             timeout=90,
             trust_env=False,  # never route our traffic through the system proxy
             json={
-                "model": CFG["model"],
+                "model": AI["model"],
                 "messages": [
-                    {"role": "system", "content": VISION_PROMPT.replace("<app>", app)},
+                    {"role": "system", "content": prompt},
                     {"role": "user", "content": [
                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                        {"type": "text", "text": f"分诊这张{'企业微信' if app == 'wecom' else '微信'}截图"},
+                        {"type": "text", "text": f"分诊这张{label}截图"},
                     ]},
                 ],
-                "max_completion_tokens": 600,
+                "max_completion_tokens": AI.get("max_completion_tokens", 600),
                 "thinking": {"type": "disabled"},
             })
         r.raise_for_status()
@@ -353,7 +428,7 @@ def analyze(bgra, w, h, app: str) -> dict | None:
             text = text.strip("`").removeprefix("json").strip()
         return json.loads(text)
     except Exception as e:
-        log(f"analyze error [{app}]: {e!r}")
+        log(f"analyze error [{key}]: {e!r}")
         return None
 
 
@@ -378,7 +453,7 @@ def is_active_hours() -> bool:
     return ACTIVE_FROM <= datetime.now().hour < ACTIVE_TO
 
 
-def scan_app(app: str, cfg: dict) -> tuple[str, dict | None]:
+def scan_app(key: str, spec: dict) -> tuple[str, dict | None]:
     """P2-3：返回 (状态, 结果)。原来任何失败都 return None，调用方却无条件
     scanned += 1 —— 窗口找不到七轮照样心跳「2/2 apps scanned」，watchdog 的
     quiet/link 双绿（2026-09-23 实测 08:35-11:35 连续 7 轮 window not found
@@ -386,37 +461,42 @@ def scan_app(app: str, cfg: dict) -> tuple[str, dict | None]:
 
     状态：
       ok        —— 截图+识别完成，result 为 dict（unread 可能为空）
-      closed    —— 连该类名的窗口都没有 = 应用没开（没消息可漏，不算故障）
+      closed    —— 三层匹配都找不到窗 = 应用没开（没消息可漏，不算故障）
       minimized —— 窗口在但太窄（min_w=0 找得到、min_w 找不到）= 最小化，
                    采集不了（故障态：应用在跑但瞎了）
       capture   —— PrintWindow 失败（故障态）
       analyze   —— 识别失败（故障态，analyze 内部已 log error）
     """
-    info = find_window(cfg["class"], cfg["title"], cfg["min_w"])
+    label = spec.get("label", key)
+    hint = spec.get("prompt_hint", "")
+    # 目标级 prompt 字段 = 整段覆盖默认模板；没写就按 label+prompt_hint 拼
+    prompt = spec.get("prompt") or _prompt_for(label, hint)
+    info = find_target(spec)
     if not info:
         # 三态区分就在这二次探测：min_w=0 能不能找到
-        if find_window(cfg["class"], cfg["title"], 0):
-            log(f"[{app}] window too narrow (minimized?), skip")
+        if find_target(spec, min_w=0):
+            log(f"[{key}] window too narrow (minimized?), skip")
             return "minimized", None
-        log(f"[{app}] window not found (app closed?), skip")
+        log(f"[{key}] window not found (app closed?), skip")
         return "closed", None
     hwnd, x, y, w, h = info
     if park_needed(hwnd):  # any part visible → park it
         move_offscreen(hwnd, w, h)
     cap = capture(hwnd)
     if not cap:
-        log(f"[{app}] capture failed")
+        log(f"[{key}] capture failed")
         return "capture", None
-    result = analyze(*cap, app)
+    result = analyze(*cap, key, label, prompt)
     if result is None:
         return "analyze", None
-    result["_app"] = app
+    result["_app"] = key
+    result["_label"] = label
     return "ok", result
 
 
 def handle(result: dict):
     app = result.get("_app", "?")
-    label = "企业微信" if app == "wecom" else "微信"
+    label = result.get("_label", app)
     unread = result.get("unread", [])
     important = result.get("important", [])
     archive({"ts": time.time(), "app": app, "unread": unread,
@@ -472,21 +552,24 @@ def handle(result: dict):
 
 
 def main():
-    log(f"vision listener v0.6: poll={POLL_MIN}min, active {ACTIVE_FROM}:00-{ACTIVE_TO}:00, targets={list(TARGETS)}")
-    for app, cfg in TARGETS.items():
-        info = find_window(cfg["class"], cfg["title"], cfg["min_w"])
+    log(f"vision listener: poll={POLL_MIN}min(sleep {POLL_SLEEP_MIN}min), "
+        f"active {ACTIVE_FROM}:00-{ACTIVE_TO}:00, ai={AI.get('model', '未配置')}, "
+        f"targets={list(TARGETS) or '无 —— 检查 fp.config.json 的 vision 块'}")
+    for key, spec in TARGETS.items():
+        info = find_target(spec)
         if info:
             hwnd, x, y, w, h = info
             if park_needed(hwnd):
                 move_offscreen(hwnd, w, h)
-            log(f"[{app}] hwnd={hwnd} parked")
+            log(f"[{key}] hwnd={hwnd} parked")
         else:
-            log(f"[{app}] not found at startup (will retry each cycle)")
+            log(f"[{key}] not found at startup (will retry each cycle)")
 
     # P2-3：连续 2 轮「应用在跑但采不了」直推手机 —— 必须放 while 外面，
     # 否则每轮重置、永远到不了 2
     fault_streak: dict[str, int] = {}
     fault_alerted: set[str] = set()
+    last_scan: dict[str, float] = {}   # 目标级到期判断：上次实际扫描的时刻
     while True:
         if not is_active_hours():
             log("night quiet hours, sleeping 10min")
@@ -495,14 +578,19 @@ def main():
         # P2-9：一口气睡满 30min 时，夜间最后一行（如 07:55）到 08:00 换挡
         # 后的首个心跳之间会隔 600+1800+两段 90s 识别 ≈ 2580s，离 quiet 阈值
         # 2700s 只剩 2 分钟，AI 稍慢每天早上误报。分段睡：每 300s 一条心跳，
-        # 最大相邻间隔降到 300s + 一轮扫描。
+        # 最大相邻间隔降到 300s + 一轮扫描。步长按最小间隔（含目标级）算。
         slept = 0
-        while slept < POLL_MIN * 60:
+        while slept < POLL_SLEEP_MIN * 60:
             time.sleep(300)
             slept += 300
-            log(f"sleep heartbeat: {slept}/{POLL_MIN * 60}s")
+            log(f"sleep heartbeat: {slept}/{POLL_SLEEP_MIN * 60}s")
         scanned = 0
+        cycle_at = time.time()
         for app, cfg in TARGETS.items():
+            # 目标级 poll_min：睡眠已按最小间隔醒，这里只放行到期的目标
+            if cycle_at - last_scan.get(app, 0.0) < int(cfg.get("poll_min") or POLL_MIN) * 60:
+                continue
+            last_scan[app] = cycle_at
             # 每轮每个 app 一个 trace：截图、识别、推送、归档全用同一个 id，
             # 出问题时 grep 一次就能拉出这一轮的完整过程
             pclog.set_trace_id(None)
@@ -544,23 +632,23 @@ def park_main() -> None:
     """一次性归位工具（原独立的 park_windows.py，已并入本文件）。
 
     用法: python vision_listener.py park
-    把微信/企业微信窗口挪到屏幕外 —— 重启/重开 App 后手动跑一次，窗口就不
-    会坐在屏幕上。已在屏外的不动；对显示/分辨率/缩放变化免疫。
+    把 fp.config.json vision 块里配置的窗口挪到屏幕外 —— 重启/重开 App 后手动
+    跑一次，窗口就不会坐在屏幕上。已在屏外的不动；对显示/分辨率/缩放变化免疫。
     """
     delay, retry = 3, 3
     for attempt in range(retry):
         found_any = False
-        for app, cfg in TARGETS.items():
-            info = find_window(cfg["class"], cfg["title"], cfg["min_w"])
+        for key, spec in TARGETS.items():
+            info = find_target(spec)
             if not info:
-                print(f"[{app}] 窗口未找到（没开或托盘中），跳过")
+                print(f"[{key}] 窗口未找到（没开或托盘中），跳过")
                 continue
             hwnd, x, y, w, h = info
             if park_needed(hwnd):
                 move_offscreen(hwnd, w, h)
-                print(f"[{app}] 已挪到屏幕外（显示器右边缘之外）")
+                print(f"[{key}] 已挪到屏幕外（显示器右边缘之外）")
             else:
-                print(f"[{app}] 已在屏幕外，无需处理")
+                print(f"[{key}] 已在屏幕外，无需处理")
             found_any = True
         if found_any or attempt == retry - 1:
             break
@@ -572,8 +660,51 @@ def park_main() -> None:
         pass
 
 
+def list_main() -> None:
+    """列出可见顶层窗口（pid/exe/类名/标题/尺寸）—— 填 fp.config.json vision 块用。
+
+    用法: python vision_listener.py list
+    """
+    rows = []
+    pid_exe: dict[int, str] = {}
+    CB = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd, lp):
+        if not USER32.IsWindowVisible(hwnd):
+            return True
+        t = ctypes.create_unicode_buffer(256)
+        USER32.GetWindowTextW(hwnd, t, 256)
+        if not t.value:
+            return True
+        pid = wintypes.DWORD()
+        USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        cls = ctypes.create_unicode_buffer(64)
+        USER32.GetClassNameW(hwnd, cls, 64)
+        r = wintypes.RECT()
+        USER32.GetWindowRect(hwnd, ctypes.byref(r))
+        w, h = r.right - r.left, r.bottom - r.top
+        rows.append((w * h, pid.value, _exe_of(pid.value, pid_exe),
+                     cls.value, t.value, w, h))
+        return True
+
+    USER32.EnumWindows(CB(cb), 0)
+    rows.sort(reverse=True)
+    print(f"{'pid':>7}  {'exe':<20} {'class':<28} {'WxH':>11}  title")
+    for area, pid, exe, cls, title, w, h in rows:
+        print(f"{pid:>7}  {exe:<20} {cls:<28} {w:>4}x{h:<5}  {title[:60]}")
+    print(f"\n共 {len(rows)} 个可见顶层窗口（按面积降序）。")
+    print("填 fp.config.json 的 vision 块：process=exe 全名（必填），"
+          "class=类名子串、title=标题正则（都可选），label/prompt_hint 给 AI 用。")
+    try:
+        input("\n按回车关闭...")
+    except EOFError:
+        pass
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in ("park", "--park"):
         park_main()
+    elif len(sys.argv) > 1 and sys.argv[1] in ("list", "--list"):
+        list_main()
     else:
         main()

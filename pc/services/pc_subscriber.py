@@ -19,19 +19,16 @@ import httpx
 
 # ---------- config ----------
 NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
-_SECRET = Path(__file__).resolve().parents[1] / "ntfy.secret"
-try:
-    NTFY_TOKEN = os.environ.get("FP_NTFY_TOKEN") or (
-        _SECRET.read_text().strip() if _SECRET.exists() else "")
-except Exception:
-    # 同 notification_listener：导入期读失败不该让 pythonw 无声退出。
-    NTFY_TOKEN = ""
 TOPICS = ["fp-vps", "fp-gray"]  # VPS hard alerts + gray-zone events
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]),            # pc/
-                str(Path(__file__).resolve().parents[1] / "core")]   # 公共件 pclog/fp_feedback/alert_fallback
+                str(Path(__file__).resolve().parents[1] / "core")]   # 公共件 pclog/fpconfig/fp_feedback/alert_fallback
 import pclog
+import fpconfig
 LOG = pclog.get_logger("pc_subscriber")
+# 取 token：FP_NTFY_TOKEN 环境变量优先、文件取到非空才缓存、失败下次重读。
+# 原先这里的 try 是防导入期无声退出 —— 该保证现在收敛在 fpconfig 内部。
+NTFY_TOKEN = fpconfig.ntfy_token()
 
 
 def log(msg):
@@ -39,7 +36,7 @@ def log(msg):
 
 
 def _auth() -> dict:
-    """鉴权头。**空 token 时不带头**，且每次取不到都会重试读文件。
+    """鉴权头。**空 token 时不带头**，且每次取不到都会重试（fpconfig 非空才缓存）。
 
     空 ``Bearer `` 是非法头值 → httpx 抛 LocalProtocolError（TransportError），
     在订阅热循环里每次重试都炸一遍（第 5 轮在 ai_triager 上确认的同型问题，
@@ -48,12 +45,7 @@ def _auth() -> dict:
     """
     global NTFY_TOKEN
     if not NTFY_TOKEN:
-        try:
-            NTFY_TOKEN = (os.environ.get("FP_NTFY_TOKEN")
-                          or (_SECRET.read_text().strip()
-                              if _SECRET.exists() else ""))
-        except Exception:
-            return {}
+        NTFY_TOKEN = fpconfig.ntfy_token()
     return {"Authorization": f"Bearer {NTFY_TOKEN}"} if NTFY_TOKEN else {}
 
 # ---------- toast ----------
@@ -124,7 +116,7 @@ def run():
             # Build a FRESH client per attempt, with trust_env=False.
             # httpx reads the Windows system proxy (registry ProxyEnable/
             # ProxyServer) when trust_env is on; a long-lived client keeps that
-            # proxy baked into its mounts forever, so once 本地代理客户端 flips its
+            # proxy baked into its mounts forever, so once the local proxy flips its
             # system proxy off the client hammers a dead port and every retry
             # fails with WinError 10061 until the process is restarted. Our
             # traffic is loopback -> SSH tunnel, so it must never use a proxy.

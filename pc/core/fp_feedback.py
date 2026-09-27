@@ -30,6 +30,7 @@ import time
 from pathlib import Path
 
 import pclog
+import fpconfig
 
 HERE = Path(__file__).resolve().parents[1]  # pc/（本文件在 pc/core/）
 # r7-7：**惰性**创建 handler。原来模块顶层 get_logger —— ai_triager 顶层
@@ -76,8 +77,8 @@ def public_base() -> str:
     """手机点按钮时要打的地址 —— 必须是 VPS 公网口，不是 127.0.0.1。
 
     手机不在这个网络里，本地隧道它够不着（README「手机」一节：订阅地址填
-    http://VPS-IP:2586）。优先取环境变量，否则从 vps.secret 第一段推导，
-    与 ntfy_tunnel.py 同一份凭据，不新增配置项。
+    http://VPS-IP:2586）。优先取环境变量，否则从 fp.config.json 的 vps 块
+    推导，与 ntfy_tunnel.py 同一份凭据，不新增配置项。
     """
     env = os.environ.get("FP_NTFY_PUBLIC", "").strip()
     if env:
@@ -86,8 +87,7 @@ def public_base() -> str:
     if _base_cache:             # 于是这句读到未赋值的局部 → UnboundLocalError
         return _base_cache
     try:
-        secret = HERE.parent / "vps.secret"
-        host = secret.read_text(encoding="utf-8").split()[0]
+        host = fpconfig.vps()[0]
         # 成功才缓存：失败要保留每次重试的机会（以及每次那行告警日志）
         _base_cache = f"http://{host}:2586"
         return _base_cache
@@ -103,22 +103,14 @@ def _token() -> str:
 
     **失败不缓存**：AV/权限抖动让首次读失败就永久缓存成空串的话，本进程
     之后所有推送永远没按钮、还没一行日志 —— 和 public_base() 里写明的取舍
-    （成功才缓存、失败留重试和告警）矛盾。宁可每条多读一次小文件。
-    测试里直接替换 _token 这个函数对象即可绕过缓存。"""
+    （成功才缓存、失败留重试和告警）矛盾。宁可每条多读一次。
+    测试里直接替换 _token 这个函数对象即可绕过缓存。
+    fpconfig 内部同样非空才缓存、空则重读，两层缓存语义一致。"""
     global _token_cache
     if _token_cache is None or _token_cache == "":
-        try:
-            tok = (HERE / "ntfy.secret").read_text(encoding="utf-8").strip()
-        except Exception as e:
-            log(f"ntfy.secret unreadable ({e!r}) —— 本轮推送不带反馈按钮")
-            return ""
+        tok = fpconfig.ntfy_token()
         if not tok:
-            # 文件存在但空/全空白（部署顺序、占位文件、写入未完成）：
-            # 和读失败一个待遇 —— 不缓存、打日志、下次重试。缓存空串的
-            # 话，之后补上真 token 也不生效，直到进程重启，而且从头到尾
-            # 一行日志都没有 —— 正是本函数 docstring 里写明要避免的那件事，
-            # 第 3 轮只堵了异常路径、漏了这条（第 4 轮）。
-            log("ntfy.secret is empty —— 本轮推送不带反馈按钮")
+            log("fp.config.json 的 ntfy.token 取不到 —— 本轮推送不带反馈按钮")
             return ""
         _token_cache = tok
     return _token_cache

@@ -25,16 +25,13 @@ from winrt.windows.ui.notifications.management import (
 
 # ---------- config ----------
 NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
-_SECRET = Path(__file__).resolve().parents[1] / "ntfy.secret"
-try:
-    NTFY_TOKEN = os.environ.get("FP_NTFY_TOKEN") or (
-        _SECRET.read_text().strip() if _SECRET.exists() else "")
-except Exception:
-    # 导入期读取包 try：AV 在 exists() 和 read_text() 之间独占一下就足以
-    # 让进程在 excepthook 挂上之前无声退出（pythonw 下连日志都没有）。
-    # 空 token 先跑起来，_auth() 不带头、服务端回 401，上层的
-    # `ntfy publish failed` 日志会留痕（第 5 轮同型问题）。
-    NTFY_TOKEN = ""
+sys.path[:0] = [str(Path(__file__).resolve().parents[1]),            # pc/
+                str(Path(__file__).resolve().parents[1] / "core")]   # 公共件 pclog/fpconfig/fp_feedback/alert_fallback
+import fpconfig
+# 取 token：FP_NTFY_TOKEN 优先、文件取到非空才缓存、失败下次重读。原先
+# 包 try 是防导入期无声退出（AV 在 exists/read 之间独占）—— 该保证现在
+# 收敛在 fpconfig 内部。
+NTFY_TOKEN = fpconfig.ntfy_token()
 TOPIC = "fp-pc"
 POLL_SEC = 3
 ARCHIVE = Path(__file__).resolve().parents[1] / "notifications.jsonl"  # pc/
@@ -82,12 +79,7 @@ def _auth() -> dict:
     """
     global NTFY_TOKEN
     if not NTFY_TOKEN:
-        try:
-            NTFY_TOKEN = (os.environ.get("FP_NTFY_TOKEN")
-                          or (_SECRET.read_text().strip()
-                              if _SECRET.exists() else ""))
-        except Exception:
-            return {}
+        NTFY_TOKEN = fpconfig.ntfy_token()   # 环境变量优先；非空才缓存，空则下次重读
     return {"Authorization": f"Bearer {NTFY_TOKEN}"} if NTFY_TOKEN else {}
 
 

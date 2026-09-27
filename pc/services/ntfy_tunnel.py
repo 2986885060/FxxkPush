@@ -7,7 +7,7 @@ relays), so the push channel survives networks that block the ntfy port.
 
 All PC-side services should talk to http://127.0.0.1:2586.
 
-Credentials: vps.secret ("host port user password"), same file as vps_exec.py.
+Credentials: fp.config.json 的 vps 块（fpconfig.vps()），与 vps_exec.py 同源。
 Run detached; auto-reconnects on drop.
 """
 import select
@@ -27,6 +27,7 @@ REMOTE_HOST, REMOTE_PORT = "127.0.0.1", 2586
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]),            # pc/
                 str(Path(__file__).resolve().parents[1] / "core")]   # 公共件 pclog/fp_feedback/alert_fallback
 import pclog
+import fpconfig
 LOG = pclog.get_logger("ntfy_tunnel")
 
 
@@ -37,7 +38,7 @@ def log(msg):
 
 
 def read_secret():
-    host, port, user, password = (HERE.parent / "vps.secret").read_text().split()
+    host, port, user, password = fpconfig.vps()   # 没配置抛 ValueError（main 的重试循环接得住）
     return host, int(port), user, password
 
 

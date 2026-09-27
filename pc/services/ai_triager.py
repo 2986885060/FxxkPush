@@ -10,7 +10,7 @@ on pushes this service sent), asks the configured cloud/local OCR model to class
 Repeats of the same source+content inside a sliding window are suppressed
 entirely (no API call, no push).
 
-注：triage_config.json 的 ``daily_report_time`` 和 state 里的 ``last_report``
+注：fp.config.json ai 块的 ``daily_report_time`` 和 state 里的 ``last_report``
 是**预留键，日报尚未实现**（见 README Roadmap），这里不声称有这功能。
 
 Runs alongside pc_subscriber.py / notification_listener.py.
@@ -32,23 +32,12 @@ import pclog
 import fp_feedback
 
 HERE = Path(__file__).resolve().parents[1]  # pc/（本文件在 pc/services/）
-try:
-    CONFIG = json.loads((HERE / "triage_config.json").read_text(encoding="utf-8"))
-except Exception:
-    # 损坏的 JSON、或 read_text 被 AV 瞬间独占 —— 这行跑在下面
-    # sys.excepthook 挂上**之前**，pythonw 下会无声退出（第 5 轮：这类
-    # 导入期读取点全仓库有 4 处，这是其中之一）。给一份能跑起来的配置：
-    # api_key 空 → classify 收 401，那是 LLM 侧、有 .response，走服务端
-    # 退避并留日志 —— 比进程直接消失好得多。
-    CONFIG = {}
-if not isinstance(CONFIG, dict):
-    # r7-9a：文件是合法 JSON 但不是对象（数组/字符串/数字）时，json.loads
-    # 不抛异常，CONFIG 就成了非 dict —— 下面 setdefault 直接 AttributeError，
-    # 而这行跑在 sys.excepthook 挂上**之前**，pythonw 下无声退出。watchdog
-    # 每 300s revive 一次，每次都在同一行死 -> 无人可自动修复的崩溃循环，
-    # 每 5 分钟只留一行 FATAL。降级成空 dict，由 setdefault 补齐必需键。
-    CONFIG = {}
-# 补齐必需键：即使配置文件被手改少了字段，也不该在运行中途 KeyError。
+# 配置改由共享读取器提供（fp.config.json 单一来源）：缺文件/坏块/非对象
+# 都由 fpconfig 降级成带默认值的 dict —— 原来这里手写的「try + isinstance +
+# setdefault」三道防线就是为导入期无声退出准备的，现在收敛到 fpconfig 一处。
+import fpconfig
+CONFIG = fpconfig.ai()
+# 补齐必需键：即使配置被手改少了字段，也不该在运行中途 KeyError。
 CONFIG.setdefault("model", "云端/本地OCR模型")
 CONFIG.setdefault("dedup_window_sec", 1800)
 CONFIG.setdefault("api_key", "")
@@ -56,9 +45,9 @@ CONFIG.setdefault("base_url", "云端/本地OCR模型端点")
 CONFIG.setdefault("max_tokens", 200)
 
 NTFY_BASE = os.environ.get("FP_NTFY_URL", "http://127.0.0.1:2586")  # via SSH tunnel (see pc/ntfy_tunnel.py)
-_SECRET = HERE / "ntfy.secret"
-# token 走惰性读取，见下面的 ntfy_token() —— 导入期读一次会把一次 AV 抖动
-# 永久定成空串，而空 token 发出去的 `Bearer ` 是非法头值（第 5 轮 P2·必修）。
+# token 惰性读取见下面的 ntfy_token()：fpconfig 非空才缓存、失败/空不缓存，
+# 导入期读一次把 AV 抖动永久定成空串的坑（空 `Bearer ` 是非法头值）由
+# fpconfig 的契约兜住。
 ARCHIVE = HERE / "triage_log.jsonl"
 STATE = HERE / "triage_state.json"
 
@@ -104,7 +93,6 @@ def log(msg):
     pclog.log_auto(LOG, msg)
 
 
-_token_cache: str | None = None
 
 
 def ntfy_token() -> str:
@@ -120,15 +108,10 @@ def ntfy_token() -> str:
     文件恢复后本函数下一次调用就读到真 token，自愈 ——这才是和
     fp_feedback._token() 一致的契约（那边每次推送都重读）。
     """
-    global _token_cache
-    if _token_cache is None or _token_cache == "":
-        try:
-            tok = _SECRET.read_text().strip() if _SECRET.exists() else ""
-        except Exception as e:
-            log(f"ntfy.secret unreadable ({e!r}) —— 本轮请求不带鉴权头")
-            return ""
-        _token_cache = tok
-    return _token_cache
+    # 转发 fpconfig 的契约：非空才缓存、失败/空不缓存、下次调用自动重试
+    # （文件恢复后立刻自愈）。取不到时不打日志 —— 空 token 期间上层的 401
+    # 每 5s 已经留痕，这里再刷只会复刻「空 token 打爆日志」那场事故。
+    return fpconfig.ntfy_token()
 
 
 def _auth() -> dict:
@@ -417,7 +400,7 @@ async def handle_event(client, st, topic, ev):
         return
 
     # TEST RULE: anything containing "text" always goes straight to the
-    # phone (bypasses AI + dedup) so user can test the pipe anytime.
+    # phone (bypasses AI + dedup) so users can test the pipe anytime.
     if "text" in content.lower():
         archive({"ts": time.time(), "topic": topic, "src": src,
                  "content": content, "label": "测试直推"})
@@ -713,7 +696,7 @@ async def main():
         # Rebuild the client on every reconnect attempt with trust_env=False.
         # With trust_env on, httpx snapshots the Windows system proxy at
         # construction time; the long-lived client then keeps retrying through
-        # a proxy port that 本地代理客户端 may have since torn down, and every request
+        # a proxy port that the local proxy client may have since torn down, and every request
         # fails (WinError 10061) until the process restarts. We talk to a
         # loopback tunnel and to the API directly, so never use a proxy.
         try:

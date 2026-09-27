@@ -12,8 +12,9 @@ REM
 REM Uses python.exe (console) so you can read each step; logs also go to
 REM pc\logs\start_services.log via pclog.
 
-set "PY=C:\Users\user\fuckpush\.venv\Scripts\python.exe"
-set "PC=C:\Users\user\fuckpush\pc"
+set "ROOT=%~dp0..\.."
+set "PY=%ROOT%\.venv\Scripts\python.exe"
+set "PC=%ROOT%\pc"
 
 "%PY%" "%PC%\bootstrap\start_services.py"
 set RC=%ERRORLEVEL%

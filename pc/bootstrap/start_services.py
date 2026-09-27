@@ -32,6 +32,7 @@ POST_HEALTH_DELAY = 1.5    # health 200 后给隧道一点热身时间
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]),            # pc/
                 str(Path(__file__).resolve().parents[1] / "core")]   # 公共件 pclog/fp_feedback/alert_fallback
 import pclog
+import fpconfig
 LOG = pclog.get_logger("start_services")
 
 # 顺序就是依赖：隧道必须先通，其余才连得上；watchdog 最后（它监控前面所有）
@@ -47,8 +48,7 @@ EXPECT_PER_SCRIPT = 2       # venv pythonw.exe 是 shim，真身另起一个：�
 
 
 def _token() -> str:
-    p = HERE / "ntfy.secret"
-    return p.read_text().strip() if p.exists() else ""
+    return fpconfig.ntfy_token()   # 取到非空才缓存，空则下次重读（AV 抖动自愈）
 
 
 _denied = [0]          # cmdline 读不到(AccessDenied) 的进程数（r7-12）
@@ -217,7 +217,7 @@ def _main() -> int:
         LOG.error("隧道日志最后几行:\n" + tail(HERE / "logs" / "ntfy_tunnel.log"))
         print(f"\n[失败] 隧道 health 未通过（{HEALTH_TIMEOUT}s 内）：{detail}")
         print("后面的服务已按要求不起 —— 没有隧道，它们只会空转刷错。")
-        print("排查: logs/ntfy_tunnel.log  |  vps.secret 是否正确 / SSH 端口是否通")
+        print("排查: logs/ntfy_tunnel.log  |  fp.config.json 的 vps 块是否正确 / SSH 端口是否通")
         # P2-2：健康门失败也必须把 watchdog 起起来。原来 return 2 发生在
         # start(ORDER[1:]) 之前，于是**这次重启之后整机零告警能力** ——
         # 控制台还能看见（人工跑的时候），一旦挂成计划任务/静默重启就是

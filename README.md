@@ -4,6 +4,13 @@
 
 **核心能力：手机可以放心关闭微信、QQ、企业微信等后台**——所有需要你知道的消息，由 PC 端 AI 分诊后主动推到手机；垃圾消息静默归档，不打扰。同时 VPS 的异常（宕机前兆、入侵、磁盘告急）也会第一时间推到你手上。
 
+## 基于 ntfy 二次开发
+
+本项目基于 [ntfy](https://ntfy.sh/)（[GitHub · binwiederhier/ntfy](https://github.com/binwiederhier/ntfy)）
+进行二次开发与深度集成：服务端直接复用 ntfy 作为消息中继与手机推送通道，
+PC 端按其发布/订阅协议接入，并在其之上构建了 AI 分诊、误判反馈、链路自愈
+与三层降级告警等能力。ntfy 采用 Apache-2.0 许可证。
+
 ## 这解决了什么问题
 
 - 手机关掉微信/QQ 后台 → 省电省内存，再也不用频繁清后台
@@ -51,7 +58,7 @@ PC 侧所有服务 → http://127.0.0.1:2586 → (pc/services/ntfy_tunnel.py 走
 pc/
 ├── services/    6 个常驻服务（= 6 个自启入口 / 独立进程边界，共 12 进程）
 │   ├── ntfy_tunnel / pc_subscriber / notification_listener
-│   ├── ai_triager / vision_listener（微信+企微视觉分诊）/ watchdog
+│   ├── ai_triager / vision_listener（窗口视觉分诊，清单见 fp.config.json vision 块）/ watchdog
 ├── core/        公共件：pclog（统一日志）/ fp_feedback（反馈闭环）/ alert_fallback（三层降级推送）
 ├── bootstrap/   启动编排与自启注册：start_services.py + install/restart 两个 .bat
 ├── logs/        统一日志（pclog 唯一出口）
@@ -63,7 +70,7 @@ pc/
 | 来源 | 方式 | 实时性 |
 |---|---|---|
 | QQ / 钉钉 / 学习通等（走 Windows toast 的 App） | UserNotificationListener 抓系统通知 | 秒级实时 |
-| 微信 / 企业微信（自绘 UI，不走系统通知） | 窗口藏屏外，定时 PrintWindow 截图 → 云端/本地OCR模型视觉识别 | 30 分钟轮询 |
+| 自绘 UI、不走系统通知的应用（微信 / 企微 / QQ…，清单见 fp.config.json vision 块） | 窗口藏屏外，定时 PrintWindow 截图 → 云端/本地OCR模型视觉识别 | 30 分钟轮询 |
 | VPS 日志 | journalctl 采集 + 硬规则 grep 判级 | 60 秒巡检 |
 
 微信/企业微信的视觉方案说明：这两个 App 的通知是自绘的、不走 Windows 通知中心，UIA 控件树也是黑盒。本项目的解法是把主窗口挪到屏幕外（保持可见不最小化），定时用 PrintWindow 离屏截图发给视觉模型识别——**全程无鼠标劫持、不挡屏幕、不影响操作电脑**。
@@ -91,8 +98,8 @@ apt install ntfy
 cp deploy/ntfy-server.yml /etc/ntfy/server.yml
 
 # 创建管理员用户并签发 token（默认拒绝匿名访问）
-NTFY_PASSWORD=你的密码 ntfy user add --role admin user
-ntfy token add user        # 输出 tk_xxx，PC 侧要用
+NTFY_PASSWORD=你的密码 ntfy user add --role admin 你的管理员用户名
+ntfy token add 你的管理员用户名   # 输出 tk_xxx，PC 侧要用
 
 # 启动并设置开机自启
 systemctl enable --now ntfy
@@ -149,23 +156,35 @@ uv pip install --python .venv httpx winotify paramiko winrt-runtime `
 .venv\Scripts\python.exe pc\services\notification_listener.py --grant-access
 ```
 
-配置本地文件（都不入库）：
+配置一个文件（都不入库）——仓库根的 `fp.config.json`，PC 侧全部配置只此
+一份（支持 `//` 注释，读取器 `pc/core/fpconfig.py`）：
 
 ```
-vps.secret              # 一行：host port user password（隧道与 vps_exec.py 用）
-pc/ntfy.secret          # 一行：ntfy token（tk_xxx）
-pc/triage_config.json   # AI 配置，示例：
 {
-  "provider": "云端/本地OCR",
-  "base_url": "云端/本地OCR模型端点",
-  "api_key": "sk-你的key",
-  "model": "云端/本地OCR模型",
-  "wechat_poll_min": 30,
-  "wechat_my_name": "你的微信昵称",
-  "dedup_window_sec": 1800,
-  "max_tokens": 200
+  "ai":     { "provider": "", "base_url": "云端/本地OCR模型端点",
+              "api_key": "sk-你的key", "model": "云端/本地OCR模型",
+              "max_tokens": 200, "max_completion_tokens": 600,
+              "dedup_window_sec": 1800, "daily_report_time": "22:00" },
+  "ntfy":   { "token": "tk_xxx" },
+  "vps":    { "host": "你的VPS-IP", "port": 22, "user": "root",
+              "password": "…" },
+  "vision": {
+    "settings": { "poll_min": 30, "my_name": "你的昵称",
+                  "active_from": 8, "active_to": 24,
+                  "dedup_ttl_sec": 21600, "offscreen_offset": 120,
+                  "ignore_chats": ["公众号"] },
+    "wechat": { "process": "Weixin.exe", "class": "Qt51514",
+                "title": null, "min_w": 400, "label": "微信",
+                "prompt_hint": "左侧为会话列表，红色气泡为未读" },
+    "qq":     { "process": "QQ.exe", "min_w": 400, "label": "QQ",
+                "prompt_hint": "左侧为会话列表，红色气泡为未读" }
+  }
 }
 ```
+
+四段信息各归其位：① `ai` = 三处分诊共用的 OCR 端点与分诊参数 ②
+`ntfy.token` = ntfy token ③ `vps` = SSH 四段凭据 ④ `vision` = 窗口清单 +
+视觉运行参数。（历史版本中的四份旧配置文件已删除，内容全部并入本文件。）
 
 ### 4. PC：启动与自启
 
@@ -199,7 +218,7 @@ Start-Sleep 5
 .venv\Scripts\pythonw.exe pc\services\pc_subscriber.py          # 2) 订阅 VPS 告警 → 弹 toast
 .venv\Scripts\pythonw.exe pc\services\notification_listener.py  # 3) 抓 Windows 通知
 .venv\Scripts\pythonw.exe pc\services\ai_triager.py             # 4) AI 分诊
-.venv\Scripts\pythonw.exe pc\services\vision_listener.py # 5) 微信/企业微信视觉识别
+.venv\Scripts\pythonw.exe pc\services\vision_listener.py # 5) 窗口视觉识别（清单见 fp.config.json vision 块）
 .venv\Scripts\pythonw.exe pc\services\watchdog.py               # 6) 管道自检（故障直接推手机）
 ```
 
@@ -207,7 +226,7 @@ Start-Sleep 5
 
 ```powershell
 # a) 隧道通不通
-curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0.1:2586/v1/health   # 期望 200
+curl.exe -H "Authorization: Bearer $((Get-Content fp.config.json -Raw -Encoding UTF8 | ConvertFrom-Json).ntfy.token)" http://127.0.0.1:2586/v1/health   # 期望 200（PS5.1 必须 -Encoding UTF8，否则无 BOM 的 UTF-8 被按 ANSI 解成乱码）
 
 # b) 端到端：任意渠道发含 text 的消息 → 手机收到（测试通道，绕过 AI 与去重）
 # c) 微信/企业微信：让人发条消息 → 30 分钟内 AI 分诊，重要则手机响
@@ -226,11 +245,11 @@ curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0
 | `deploy/ntfy-server.yml` | VPS | ntfy 服务端配置（token 鉴权，deny-all） |
 | `pc/services/ntfy_tunnel.py` | PC (自启) | SSH 本地转发：`127.0.0.1:2586` → VPS ntfy，绕开端口封锁，断线自愈 |
 | `pc/services/notification_listener.py` | PC (自启) | UserNotificationListener 抓 toast → fp-pc + JSONL 归档 |
-| `pc/services/vision_listener.py` | PC (自启) | 微信/企业微信窗口藏屏外 → 定时截图 → 云端/本地OCR模型视觉分诊 |
+| `pc/services/vision_listener.py` | PC (自启) | 按 `fp.config.json` vision 块清单把窗口藏屏外 → 定时截图 → 云端/本地OCR模型视觉分诊（进程→类名→标题正则三层匹配） |
 | `pc/services/pc_subscriber.py` | PC (自启) | 订阅 fp-vps/fp-gray，弹 Windows toast |
 | `pc/services/ai_triager.py` | PC (自启) | 消费 fp-pc/fp-gray/fp-vps/fp-feedback → AI 分诊 → fp-phone / 静默，反馈经 `fp_feedback` 改写规则 |
 | `pc/core/fp_feedback.py` | PC (由 ai_triager 调用) | 误判反馈闭环：👍/👎 按钮构造、反馈落盘（自带 content 快照 = 微调语料）、源级规则状态机（3 次👎→静默跳过 AI，👍 可撤销） |
-| `拖走聊天窗口.bat`（调 `pc/services/vision_listener.py park`） | PC | 一键把微信/企业微信窗口挪到屏幕外（重启后手动归位用） |
+| `拖走聊天窗口.bat`（调 `pc/services/vision_listener.py park`） | PC | 一键把清单里的窗口挪到屏幕外（重启后手动归位用） |
 | `pc/services/notification_listener.py --grant-access` | PC | 通知权限探测/诊断工具（已并入 listener） |
 | `pc/core/pclog.py` | PC | 统一日志：单一格式（ISO 带日期 + level + 服务名 + trace_id）、单一出口（`pc/logs` + stderr）、RotatingFile 2MB×3、自动分级 |
 | `pc/bootstrap/start_services.py` | PC | 启动编排：杀旧 → 起隧道 → **健康门 `health=200`** → 起其余 → 校验 6×2 进程 |
@@ -267,24 +286,25 @@ curl.exe -H "Authorization: Bearer $(Get-Content pc\ntfy.secret)" http://127.0.0
 
 | 文件 | 内容 |
 |---|---|
-| `vps.secret` | VPS SSH 凭据（`host port user password` 四段） |
-| `pc/ntfy.secret` | ntfy token（一行） |
-| `pc/triage_config.json` | AI API 地址/密钥/模型/轮询间隔/微信昵称 |
+| `fp.config.json` | **PC 侧唯一配置**（读取器 `pc/core/fpconfig.py`）：`ai` = OCR 端点与分诊参数（三处分诊共用）、`ntfy.token` = ntfy token、`vps` = SSH 四段凭据、`vision` = 窗口清单（process→class→title 三层匹配，条目支持 enabled/poll_min/prompt）+ 视觉运行参数（轮询/昵称/时段/去重/忽略名单）。支持 // 注释，填表助手 `vision_listener.py list` |
+
+> 历史版本中的 `vps.secret` / `pc/ntfy.secret` / `pc/triage_config.json` /
+> `pc/vision_targets.json` 已删除（内容全部并入 `fp.config.json`）。
 
 ## 已知边界
 
-- 微信/企业微信消息推送有最长 30 分钟延迟（轮询间隔，用实时性换零打扰，`wechat_poll_min` 可调）
+- 微信/企业微信/QQ 消息推送有最长 30 分钟延迟（轮询间隔，用实时性换零打扰，`fp.config.json` vision 块的 `settings.poll_min` 全局可调，目标条目也可单独写 `poll_min`）
 - 微信/企业微信窗口不能最小化到托盘（藏屏幕外可以），否则截图为空；重启电脑后窗口会回到屏内，双击「拖走聊天窗口.bat」归位（vision listener 每轮也会自动归位）
 - 屏幕缩放非 100% 时，操作窗口坐标的脚本**必须**先声明 DPI-aware，否则 `GetSystemMetrics` 返回虚拟化尺寸（125% 下 2048 而非物理 2560），算出的"屏幕外"位置会落在屏幕里
 - `pc_subscriber` 弹的 toast 会被 `notification_listener` 再抓一次（自己吃自己的尾巴），已用 `pc/toast_echo.jsonl` 指纹在 180 秒窗口内过滤
 - pywinrt 3.2.1 需要 Python ≤3.12（3.14 报 cannot create instances）
 - 语音/图片类通知：图片通知走视觉模型可判，语音只能看到"发来一条语音"而不知内容
-- **httpx 默认 `trust_env=True` 会读 Windows 系统代理**（本地代理客户端 的 `127.0.0.1:12334`）：长寿命客户端在代理关掉后会永久抱死该端口，所有请求 `WinError 10061` 直到进程重启。本项目所有 httpx 客户端一律 `trust_env=False`，且重连时**重建客户端不复用**
+- **httpx 默认 `trust_env=True` 会读 Windows 系统代理**（本地代理客户端的 `127.0.0.1:xxxx` 端口）：长寿命客户端在代理关掉后会永久抱死该端口，所有请求 `WinError 10061` 直到进程重启。本项目所有 httpx 客户端一律 `trust_env=False`，且重连时**重建客户端不复用**
 - **ntfy 只透传已知字段**：自定义 header（`X-Fp-Trace`）和未知 JSON 字段（`trace_id`/`sequence_id`）都会被服务端静默丢弃（HTTP 200 但订阅端收不到），只有 `tags` 完整回传 —— 所以 trace_id 寄生在 `tags` 里（`t_<8位hex>`）
 - **ntfy 会丢掉 action 的 `body_type`**（实测发出什么收不到什么），手机端最终用哪种 `Content-Type` 因此不可知。解法：action 的 `url` 直接带 topic（`…/fp-feedback`），body 放纯 JSON —— 实测 `application/json` 和 `text/plain` 两种发法都 200、`message` 都是原样 JSON
 - **反馈消息的 `title` 和 `tags` 实测均为 `None`**：任何靠 title/tags 反查原推送的匹配都会静默失配，所以 `push_id` 只能寄生在 `message` body 里，推送时的快照存 `triage_state.json` 的 `pushes`（7 天 TTL）
 - **`ai_triager.consume` 会把 message 里的 JSON 摊平成 dict 自身**（`verdict` 上浮、`message` 键消失），反馈分流必须传**原始 body** 而不是解析后的 `parsed`，否则读 `ev["message"]` 拿到 `None`
-- 精简版 Windows需验证通知中心可用（本项目环境已验证）
+- 精简版 Windows 需验证通知中心可用（本项目所用环境已验证）
 
 ## Roadmap
 
