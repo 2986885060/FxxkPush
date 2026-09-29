@@ -205,7 +205,8 @@ uv pip install --python .venv httpx winotify paramiko winrt-runtime `
 #   杀旧进程 -> 起隧道 -> 轮询 /v1/health 直到 200 -> 才起其余 5 个 -> 校验 6x2 进程
 .venv\Scripts\python.exe pc\bootstrap\start_services.py
 
-# 注册登录自启：pc\bootstrap\install_autostart.bat
+# 注册登录自启：双击项目根目录的「注册自启动.bat」（从当前目录向上探测项目根；
+# 等价实现：pc\bootstrap\install_autostart.bat）。以后挪动目录后重跑一次即可
 # （6 项，Windows 登录时并发启动；各服务自带重试，隧道就绪前会自动等待）
 ```
 
