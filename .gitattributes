@@ -4,3 +4,7 @@
 # Run entries got written). Pin the ending so it survives any checkout,
 # regardless of the local core.autocrlf setting.
 *.bat text eol=crlf
+
+# Shell scripts MUST stay LF — CRLF makes Linux/WSL bash fail with
+# "$'\r': command not found". Pinned regardless of core.autocrlf.
+*.sh text eol=lf
