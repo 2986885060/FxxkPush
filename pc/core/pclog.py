@@ -344,7 +344,13 @@ _WARN_PAT = re.compile(r"retry|reconnect|重试|ignored|skip|降级|fallback", r
 
 
 def log_auto(logger: logging.Logger, msg: str) -> None:
-    """按内容定级后写日志 —— 各服务 log() 的统一实现。"""
+    """按内容定级后写日志 —— 各服务 log() 的统一实现。
+
+    换行折叠成单行（FATAL 堆栈除外）：content 里的 \n 会让续行没有时间戳，
+    行式解析与 watchdog 的 grep 会丢后半截。
+    """
+    if not msg.startswith("FATAL"):
+        msg = msg.replace("\r\n", "\n").replace("\r", "\n").replace("\n", " ⏎ ")
     if _ERR_PAT.search(msg):
         lvl = logging.ERROR
     elif _WARN_PAT.search(msg):

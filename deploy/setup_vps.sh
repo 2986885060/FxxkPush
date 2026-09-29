@@ -62,16 +62,23 @@ fi
 # 用户已存在（复跑）时 add 会报错，忽略并继续签发 token
 NTFY_PASSWORD="$FP_NTFY_PASSWORD" ntfy user add --role admin "$ADMIN_USER" \
     >/dev/null 2>&1 || echo "      用户已存在（复跑场景），继续..."
+# set -e + pipefail 下命令替换失败会直接杀死脚本（曾导致装到一半无声退出、
+# 无任何汇总）：临时关 errexit 捕获，失败给指引并跳过 monitor，不中断输出。
+set +e
 TOKEN="$(ntfy token add "$ADMIN_USER" 2>/dev/null | tr -d '\r' | tail -n1 | tr -d ' ')"
+set -e
 if [[ "$TOKEN" != tk_* ]]; then
-    echo "[警告] token 获取异常，原始输出：$TOKEN"
+    echo "[警告] token 获取失败（输出：${TOKEN:-空}）"
+    echo "       排查：systemctl status ntfy；修复后重跑本脚本（幂等）。monitor 将跳过部署。"
+    TOKEN=""
 fi
 
-# ---- 5) 监控 systemd ----
-echo "[5/5] 部署 fuckpush-monitor ..."
-install -d -m 755 /opt/fuckpush
-cp "$HERE/vps_monitor.py" /opt/fuckpush/vps_monitor.py
-cat > /etc/systemd/system/fuckpush-monitor.service <<UNIT
+# ---- 5) 监控 systemd（拿到 token 才部署）----
+if [ -n "$TOKEN" ]; then
+    echo "[5/5] 部署 fuckpush-monitor ..."
+    install -d -m 755 /opt/fuckpush
+    cp "$HERE/vps_monitor.py" /opt/fuckpush/vps_monitor.py
+    cat > /etc/systemd/system/fuckpush-monitor.service <<UNIT
 [Unit]
 Description=FxxkPush VPS monitor
 After=network.target ntfy.service
@@ -88,12 +95,15 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 UNIT
-chmod 600 /etc/systemd/system/fuckpush-monitor.service   # 含 token，收紧权限
-systemctl daemon-reload
-systemctl enable --now fuckpush-monitor
-sleep 1
-systemctl is-active --quiet fuckpush-monitor && echo "      monitor active" \
-    || echo "      [警告] monitor 未激活，排查：journalctl -u fuckpush-monitor -n 50"
+    chmod 600 /etc/systemd/system/fuckpush-monitor.service   # 含 token，收紧权限
+    systemctl daemon-reload
+    systemctl enable --now fuckpush-monitor
+    sleep 1
+    systemctl is-active --quiet fuckpush-monitor && echo "      monitor active" \
+        || echo "      [警告] monitor 未激活，排查：journalctl -u fuckpush-monitor -n 50"
+else
+    echo "[5/5] 跳过 monitor 部署（无有效 token）"
+fi
 
 # ---- 汇总 ----
 cat <<SUMMARY
@@ -103,7 +113,7 @@ cat <<SUMMARY
 订阅话题:    fp-phone
 账号:        ${ADMIN_USER}
 密码:        ${FP_NTFY_PASSWORD}
-token:       ${TOKEN}
+token:       ${TOKEN:-<获取失败 —— 修复后重跑本脚本>}
              ↑ 复制到 PC 的 fp.config.json → ntfy.token
 
 手机端:      装 ntfy App → 订阅 → 服务器/话题/账号密码照上面填

@@ -163,9 +163,13 @@ def _load_rules() -> dict:
         # 问 AI，且锁住期间每轮都用空规则。P2-5 当时只修了 read_text 分支。
         # 保留旧缓存、**不更新 mtime**，下次调用自然重试。
         if isinstance(_rules_cache, dict):
-            log(f"rules stat failed ({e!r}), keeping previous cache")
+            # 文件不存在 = 「尚无任何规则」的正常态（每条消息都会 stat 一次，
+            # 打 ERROR 纯噪音 —— fp_feedback.log 曾在未建规则文件期刷 30+ 条）；
+            # 其它 OSError（AV 锁 / rename 竞争）才是真异常，保留日志。
+            if not isinstance(e, FileNotFoundError):
+                log(f"rules stat failed ({e!r}), keeping previous cache")
             return _rules_cache
-        mtime = -1.0      # 首次加载就撞锁：没有缓存可保，走空规则起步
+        mtime = -1.0      # 首次加载就撞锁/文件不存在：走空规则起步
     if _rules_cache is None or mtime != _rules_mtime:
         if mtime < 0:
             fresh: dict = {"sources": {}}

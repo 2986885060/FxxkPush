@@ -251,6 +251,10 @@ def publish(ev: dict):
                            headers=_auth(),
                            timeout=10, trust_env=False)
             ok = r.status_code == 200
+            if not ok:
+                # 非 200（403 token 失效 / 500）必须留 ERROR：watchdog.check_link
+                # 只数 [ERROR]，静默失败会让 link+quiet 双绿而手机收不到
+                log(f"ntfy publish failed: HTTP {r.status_code} [{ev.get('app')}]")
         except Exception as e:
             log(f"ntfy publish failed: {e!r}")
             ok = False
@@ -407,14 +411,21 @@ def check_access() -> None:
 
 
 def check_watchdog_hb() -> None:
-    """P0-2：看门人也得有人看（交叉检查，进程独立于 watchdog）。"""
-    global _hb_alert_at
+    """P0-2：看门人也得有人看（交叉检查，进程独立于 watchdog）。
+
+    结果写入 _hb_ok（True/False/None=未知），心跳行读它如实上报 ——
+    原先心跳硬编码 `watchdog_hb_ok`，判红后仍在自称 OK。
+    """
+    global _hb_alert_at, _hb_ok
     try:
         age = time.time() - HB_FILE.stat().st_mtime
     except OSError:
-        return          # 文件还没有 = watchdog 还没跑过第一轮，先不判（防开机误报）
+        _hb_ok = None   # 文件还没有 = watchdog 还没跑过第一轮，状态未知
+        return          # （防开机误报，先不告警）
     if age < 900:
+        _hb_ok = True
         return
+    _hb_ok = False      # 超龄：先记状态，再走下面的限频告警
     gap = time.time() - _hb_alert_at
     if 0 <= gap < 1800:
         return          # 同一故障 30 分钟提醒一次，别刷屏；
@@ -498,7 +509,7 @@ async def main():
             # 才 74 行）。每 5 分钟一条固定心跳，watchdog 的 quiet 检查才有
             # 判据可依。
             log(f"idle heartbeat: seen={len(seen)} pending={len(_pending)} "
-                f"watchdog_hb_ok")
+                f"watchdog_hb={'ok' if _hb_ok is True else ('STALE' if _hb_ok is False else 'unknown')}")
         await asyncio.sleep(POLL_SEC)
 
 

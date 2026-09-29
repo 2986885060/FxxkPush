@@ -28,7 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]      # pc/core/fpconfig.py → 仓库根
 PATH = ROOT / "fp.config.json"
 
-_cache: dict | None = None
+_cache: tuple | None = None   # (mtime_ns, data)；None = 未缓存（缺失/坏文件）
 _tok = ""
 
 
@@ -63,17 +63,29 @@ def _strip_comments(text: str) -> str:
 
 
 def raw(force: bool = False) -> dict:
-    """整个配置（带缓存）。文件缺失/坏掉/不是对象一律返回 {} ——
-    导入期读取点绝不因此把 pythonw 打死，降级策略由调用方决定。"""
+    """整个配置（mtime 缓存）：文件改动自动重读；坏文件/缺失**不缓存**。
+
+    以前把读失败结果缓存成 {} 且永不失效 —— 开机时被 AV/半写撞一下，整个
+    配置就钉死在空值直到重启（rules 全失效、TARGETS 空转、vps 改对也不自
+    愈）。现在：缺失→文件出现即生效（向导后补建配置）；解析失败→下次调用
+    重读；mtime 变化→改配置即时生效（apps 黑名单/必推词无需重启）。
+    导入期读取点仍绝不因此把 pythonw 打死（失败一律返回 {}）。
+    """
     global _cache
-    if _cache is not None and not force:
-        return _cache
+    try:
+        mtime = PATH.stat().st_mtime_ns
+    except OSError:
+        _cache = None            # 文件不存在：不缓存，出现后自动生效
+        return {}
+    if not force and _cache is not None and _cache[0] == mtime:
+        return _cache[1]
     try:
         data = json.loads(_strip_comments(PATH.read_text(encoding="utf-8")))
-        _cache = data if isinstance(data, dict) else {}
     except Exception:
-        _cache = {}
-    return _cache
+        _cache = None            # 半写/AV锁/手改坏：不缓存，下次重读
+        return {}
+    _cache = (mtime, data if isinstance(data, dict) else {})
+    return _cache[1]
 
 
 def reset() -> None:
@@ -156,6 +168,24 @@ def vision() -> tuple[dict, dict, list[str]]:
         if "ai" in settings:
             settings.pop("ai")
             problems.append("vision.settings.ai 已废弃：端点统一用顶层 ai 块")
+
+    def _num(key: str, default: int) -> int:
+        v = settings.get(key, default)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            problems.append(f"vision.settings.{key} 非数值({v!r})，已用默认 {default}")
+            return default
+
+    # 数值收敛：手改配置写成 "30"/"abc" 时，原实现会在导入期或扫描期 int()
+    # 直接 FATAL、或在 EnumWindows 回调里 TypeError 中止枚举（表现成「窗口
+    # 未开启」误判且服务看着健康）
+    for k, dflt in (("poll_min", 30), ("active_from", 8), ("active_to", 24),
+                    ("dedup_ttl_sec", 21600), ("offscreen_offset", 120)):
+        settings[k] = _num(k, dflt)
+    if settings["active_from"] >= settings["active_to"]:
+        problems.append("vision.settings active_from>=active_to：活跃时段为空，将永不扫描")
+
     targets: dict = {}
     for key, spec in data.items():
         if key.startswith("_"):            # 顶层 _注释 之类保留键
@@ -172,6 +202,18 @@ def vision() -> tuple[dict, dict, list[str]]:
             except re.error as e:
                 problems.append(f"[{key}] title 正则非法: {e}，跳过")
                 continue
+        spec = dict(spec)                   # 拷贝后再收敛，别改缓存
+        try:
+            spec["min_w"] = int(spec.get("min_w", 400))
+        except (TypeError, ValueError):
+            problems.append(f"[{key}] min_w 非数值，已用默认 400")
+            spec["min_w"] = 400
+        if "poll_min" in spec:
+            try:
+                spec["poll_min"] = int(spec["poll_min"])
+            except (TypeError, ValueError):
+                problems.append(f"[{key}] poll_min 非数值，已回退全局间隔")
+                spec["poll_min"] = None
         targets[key] = spec
     if not targets:
         problems.append("vision 里没有启用的目标")

@@ -444,7 +444,13 @@ def push(title, message, priority=4, topic="fp-pc"):
             "priority": priority,
             "tags": pclog.tags_with_trace(["bell"]),
         }, headers=_auth())
-        return r.status_code == 200
+        if r.status_code == 200:
+            return True
+        # 非 200（403 token 失效/500）必须留 ERROR：watchdog.check_link 只数
+        # [ERROR]，静默 False 会让 FAULT_ALERT 推送失败零痕迹、link+quiet 双绿
+        log(f"ntfy push failed: HTTP {r.status_code} topic={topic} "
+            f"title={title[:40]}")
+        return False
     except Exception as e:
         log(f"ntfy error: {e!r}")
         return False
@@ -514,13 +520,16 @@ def handle(result: dict):
     log(f"[{app}] {len(unread)} unread chats, {len(important)} important")
 
     # merge AI's important list with our hard rules (@所有人/@我/text直推)
-    flagged = {i.get("chat"): i for i in important if i.get("chat") not in ign}
+    # 黑名单判定与闸门一致用子串（闸门对 probe 是子串；这里精确等值会漏
+    # 「公众号精选」这类带前后缀的会话名）
+    flagged = {i.get("chat"): i for i in important
+               if not any(b and b in (i.get("chat") or "") for b in ign)}
     for u in unread:
         chat = u.get("chat", "")
         preview = u.get("preview", "")
-        if chat in flagged or chat in ign:
+        if chat in flagged or any(b and b in chat for b in ign):
             continue
-        if "text" in preview.lower():
+        if re.search(r"(?<![a-zA-Z])text(?![a-zA-Z])", preview, re.I):
             flagged[chat] = {"chat": chat, "reason": "测试直推"}
             continue
         if u.get("at_all") or u.get("at_me"):
@@ -597,6 +606,11 @@ def main():
         scanned = 0
         cycle_at = time.time()
         for app, cfg in TARGETS.items():
+            # apps 声明 ignore 的来源直接跳过 —— 不截图不调视觉模型（handle()
+            # 里的同名检查保留为第二道闸，这里是省钱前置）
+            if fpconfig.rules_for(cfg.get("label", app)).get("ignore"):
+                log(f"[{app}] apps 声明 ignore，本轮不扫")
+                continue
             # 目标级 poll_min：睡眠已按最小间隔醒，这里只放行到期的目标
             if cycle_at - last_scan.get(app, 0.0) < int(cfg.get("poll_min") or POLL_MIN) * 60:
                 continue
@@ -630,6 +644,18 @@ def main():
                             log(f"FAULT_ALERT [{app}] state={state} streak={n} -> phone")
             except Exception as e:
                 log(f"[{app}] cycle error: {e!r}")
+                # 异常也要进故障计数：否则「一直抛错但心跳照打」永远无人发现
+                # （与 P2-3 修的「失败照样绿」同型，只是入口从状态改成了异常）
+                fault_streak[app] = fault_streak.get(app, 0) + 1
+                n = fault_streak[app]
+                if n >= 2 and app not in fault_alerted:
+                    if push(f"[FxxkPush] {app} 采集异常",
+                            f"连续 {n} 轮扫描异常（{type(e).__name__}）：视觉分诊停摆，"
+                            f"该应用的新消息不会推手机。\n"
+                            f"排查: pc/logs/wechat_vision.log",
+                            priority=4, topic="fp-phone"):
+                        fault_alerted.add(app)
+                        log(f"FAULT_ALERT [{app}] cycle-error streak={n} -> phone")
             finally:
                 pclog.set_trace_id("-")   # 不把 trace 带到下一轮/静默期日志
         # r7-10：一轮扫完（有无新消息都算）留一条心跳 —— 原来「正常但没新消息」

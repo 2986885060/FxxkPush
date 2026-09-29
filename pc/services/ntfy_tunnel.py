@@ -116,10 +116,13 @@ def serve(client: paramiko.SSHClient):
 
 
 def main():
-    host, port, user, password = read_secret()
     while True:
         client = None
         try:
+            # 每次(重)连接都重读配置：fp.config.json 缺失/半写时抛错落入下面
+            # 的 except → 15s 重试；原先在循环外读，配置异常直接穿透进程
+            # （pythonw 下不可见），15s 重试永不执行、隧道静默死亡。
+            host, port, user, password = read_secret()
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             client.connect(host, port=port, username=user, password=password,

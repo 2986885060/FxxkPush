@@ -67,7 +67,10 @@ def push_vps(payload: dict, log) -> bool:
         # 以及 token 只在取得到时才带 header。token 出现在命令行只在自己的
         # VPS 上短暂可见（ps aux），可接受。
         tok = _token()
-        auth = f"-H 'Authorization: Bearer ***' " if tok else ""
+        # {tok} 是真 token：这行曾被脱敏误写成字面 *** → 第2层自抽出起恒 401
+        # （watchdog.log 7 次 rejected、VPS-SSH兜底送达 0 次），隧道死但 SSH 通
+        # 的经典故障里手机收不到任何远程告警。
+        auth = f"-H 'Authorization: Bearer {tok}' " if tok else ""
         cmd = (
             "set -e; "
             f"echo {b64} | base64 -d > /tmp/fp_watchdog_alert.json; "

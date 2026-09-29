@@ -727,7 +727,8 @@ def main() -> int:
                          f"已恢复（故障持续 {fmt_dur(d)}）\n{det}"
                          for n, d, det in cands.values()]
                 if len(cands) == 1:
-                    title = f"[FxxkPush] {next(iter(cands))} 已恢复"
+                    n0 = next(iter(cands))
+                    title = f"[FxxkPush] {CHECK_CN.get(n0, n0)} 已恢复"
                 else:
                     title = f"[FxxkPush] {len(cands)} 项检查已恢复"
                 if send_alert(title, "\n\n".join(parts)):

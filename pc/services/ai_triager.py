@@ -87,6 +87,18 @@ PENDING_TTL = 900
 RETRY_INTERVAL = 15        # flush_pending 的重试节拍（抽成常量：测试要能调快）
 
 
+def _enqueue_pending(title: str, message: str) -> None:
+    """硬规则推送失败进重发队列（与 fp-vps / AI 重要同款语义；无按钮无快照）。
+
+    P1：@提及/必推词/测试是用户显式要的消息 —— 隧道抖动窗口里 FAIL 即丢
+    与「推失败进 pending」不变量相悖。flush_pending 每 15s 重试一条。
+    """
+    if len(_push_pending) >= PENDING_CAP:
+        _push_pending.pop(0)
+    _push_pending.append({"title": title, "message": message,
+                          "actions": None, "pid": None, "ts": time.time()})
+
+
 def log(msg):
     # file log: pythonw runs have no console, a crash must leave evidence.
     # pclog owns rotation/format/level — do not hand-roll it here.
@@ -393,11 +405,15 @@ async def handle_event(client, st, topic, ev):
     # TEST RULE: anything containing "text" always goes straight to the
     # phone (bypasses AI + dedup) so users can test the pipe anytime.
     # 放最前：声明式规则与硬规则谁都不能压住排障通道。
-    if "text" in content.lower():
+    # 拉丁字母边界匹配：避开 context/texture 误伤，又不挡「中text国」这类
+    # 中文夹写（\b 会把 CJK 当单词字符而漏配）。
+    if re.search(r"(?<![a-zA-Z])text(?![a-zA-Z])", content, re.I):
         archive({"ts": time.time(), "topic": topic, "src": src,
                  "content": content, "label": "测试直推"})
         ok = await push_phone(client, f"[测试] {src}", content[:200])
         log(f"TEST_PUSH {'ok' if ok else 'FAIL'} [{src}] {content[:50]}")
+        if not ok:
+            _enqueue_pending(f"[测试] {src}", content[:200])
         return
 
     # 声明式来源规则（fp.config.json 的 apps 块，fpconfig.rules_for）——
@@ -432,6 +448,8 @@ async def handle_event(client, st, topic, ev):
                  "content": content, "label": "重要", "reason": "@提及硬规则"})
         ok = await push_phone(client, f"[提及] {src}", content[:200])
         log(f"MENTION_PUSH {'ok' if ok else 'FAIL'} [{src}] {content[:50]}")
+        if not ok:
+            _enqueue_pending(f"[提及] {src}", content[:200])
         return
 
     # 声明式必推词：命中即推（与 @提及 同级硬规则，绕过 AI + dedup）
@@ -444,6 +462,8 @@ async def handle_event(client, st, topic, ev):
                  "reason": f"必推词[{mp_hit}]"})
         ok = await push_phone(client, f"[规则] {src}", content[:200])
         log(f"RULE_PUSH {'ok' if ok else 'FAIL'} [{src}] hit={mp_hit} | {content[:50]}")
+        if not ok:
+            _enqueue_pending(f"[规则] {src}", content[:200])
         return
 
     # P2-6: fp-vps 是硬规则通道 —— vps_monitor 的 docstring 承诺「直接推

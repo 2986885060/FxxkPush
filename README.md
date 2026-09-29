@@ -209,6 +209,9 @@ uv pip install --python .venv httpx winotify paramiko winrt-runtime `
 只需在 `apps` 加一个条目，不必改代码。（历史版本中的四份旧配置文件已
 删除，内容全部并入本文件。）
 
+配置生效语义：`apps` 段改动**即时生效**（mtime 热加载，黑名单/必推词无需重启）；
+`vision` / `ai` / `ntfy` 段改动需运行 `restart_services.bat`（服务启动时取快照）。
+
 ### 4. PC：启动与自启
 
 **启动顺序 + 健康检查**：隧道必须先起来并确认 `health=200`，其余服务才启动。
