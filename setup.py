@@ -162,7 +162,9 @@ def step_deps() -> bool:
     if not VENV.exists():
         say("  创建 .venv（Python 3.12）...")
         if shutil.which("uv"):
-            rc, out = run(["uv", "venv", ".venv", "--python", "3.12"], timeout=300)
+            # str(VENV) 而非字面 ".venv"：生产等价（VENV==ROOT/.venv），
+            # 但单测把 VENV 打桩到临时目录时才不会动真 .venv
+            rc, out = run(["uv", "venv", str(VENV), "--python", "3.12"], timeout=300)
         else:
             py = which_python_for_venv()
             if py is None:
@@ -240,12 +242,23 @@ def step_config() -> bool:
 
     say("  （直接回车 = 用方括号里的默认值）")
     host = ask("VPS 公网 IP / 域名").strip()
+    host_tries = 0
     while not host:
+        # 上限防止 EOF/管道输入下永远拿到空串 → 死循环
+        host_tries += 1
+        if host_tries >= 5:
+            fail("VPS 地址连续 5 次为空（或输入已关闭），中止配置")
+            return False
         host = ask("VPS 公网 IP / 域名（必填）").strip()
+    port_tries = 0
     while True:
         port = ask("SSH 端口", "22")
         if port.isdigit() and 0 < int(port) < 65536:
             break
+        port_tries += 1
+        if port_tries >= 5:
+            fail("端口连续 5 次非法，中止配置")
+            return False
         warn("端口需为数字")
     user = ask("SSH 用户", "root")
     password = ask("SSH 密码（隧道/兜底推送用；纯密钥登录可留空）", secret=True)

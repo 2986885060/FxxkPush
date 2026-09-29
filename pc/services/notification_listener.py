@@ -520,7 +520,13 @@ async def _probe_access() -> int:
     print(f"current notifications: {notifs.size}")
     for i in range(min(notifs.size, 10)):
         n = notifs.get_at(i)
-        app = n.app_info.display_info.display_name
+        # 个别通知的 app_info/display_info 会抛 E_NOTIMPL（「尚未实现」）或为
+        # None —— 单条坏记录不该让整个授权探测崩溃（--grant-access 曾因此
+        # exit=1，向导 step_access 分支必失败）
+        try:
+            app = n.app_info.display_info.display_name
+        except Exception:
+            app = "<unavailable>"
         try:
             text = n.notification.visual.get_binding(
                 KnownNotificationBindings.toast_generic()).get_text_group()

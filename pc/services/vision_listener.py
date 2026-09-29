@@ -478,7 +478,9 @@ def scan_app(key: str, spec: dict) -> tuple[str, dict | None]:
         if find_target(spec, min_w=0):
             log(f"[{key}] window too narrow (minimized?), skip")
             return "minimized", None
-        log(f"[{key}] window not found (app closed?), skip")
+        # 措辞避开 pclog 的 `not found`→ERROR 规则：应用没开是良性态，
+        # 记 ERROR 会污染错误统计（每 30 分钟一条假错误）
+        log(f"[{key}] 窗口未开启（应用未运行），本轮不扫")
         return "closed", None
     hwnd, x, y, w, h = info
     if park_needed(hwnd):  # any part visible → park it
@@ -571,7 +573,7 @@ def main():
                 move_offscreen(hwnd, w, h)
             log(f"[{key}] hwnd={hwnd} parked")
         else:
-            log(f"[{key}] not found at startup (will retry each cycle)")
+            log(f"[{key}] 启动时窗口未开启（应用未运行），后续每轮继续探测")
 
     # P2-3：连续 2 轮「应用在跑但采不了」直推手机 —— 必须放 while 外面，
     # 否则每轮重置、永远到不了 2
