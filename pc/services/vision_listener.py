@@ -737,9 +737,48 @@ def list_main() -> None:
         pass
 
 
+def unpark_main() -> None:
+    """把配置的目标窗口从屏外拉回屏内（一键卸载/手动归位用）。
+
+    用法: python vision_listener.py unpark
+    挪到主显示器工作区左上偏移 (100,80)，保持原尺寸；已在屏内的不动。
+    """
+    delay, retry = 3, 3
+    for attempt in range(retry):
+        found_any = False
+        for key, spec in TARGETS.items():
+            # 用默认 min_w（与 park 一致）：主窗口在屏外尺寸不变，照样匹配；
+            # min_w=0 反而会捞到同进程的小弹窗（宽度 < min_w），把「屏外主窗」
+            # 误判成「已在屏内」——两个子命令输出互相矛盾就是这么来的。
+            info = find_target(spec)
+            if not info:
+                print(f"[{key}] 窗口未找到（没开或托盘中），跳过")
+                continue
+            hwnd, x, y, w, h = info
+            # park_needed = 「与屏幕重叠」（True=可见在屏内）。卸载要搬的是
+            # 反面：不重叠（屏外）才拉回来 —— 条件写反过一次，两个子命令
+            # 的输出互相矛盾就是这么暴露的。
+            if park_needed(hwnd):
+                print(f"[{key}] 已在屏内，无需处理")
+            else:
+                USER32.SetWindowPos(hwnd, 0, 100, 80, w, h, 0x0004)
+                print(f"[{key}] 已移回屏内 (100,80)")
+            found_any = True
+        if found_any or attempt == retry - 1:
+            break
+        print(f"窗口还没就绪，{delay}s 后重试 ({attempt + 1}/{retry})...")
+        time.sleep(delay)
+    try:
+        input("\n完成，按回车关闭...")
+    except EOFError:
+        pass
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in ("park", "--park"):
         park_main()
+    elif len(sys.argv) > 1 and sys.argv[1] in ("unpark", "--unpark"):
+        unpark_main()
     elif len(sys.argv) > 1 and sys.argv[1] in ("list", "--list"):
         list_main()
     else:

@@ -1,4 +1,4 @@
-# FxxkPush v0.6.0
+# FxxkPush v0.7.0
 
 自建 AI 消息分诊推送服务：PC 上的 AI 判断"哪些通知值得打扰手机"，重要的经 ntfy 推到手机/手表，垃圾静默归档。
 
@@ -309,6 +309,19 @@ curl.exe -H "Authorization: Bearer $((Get-Content fp.config.json -Raw -Encoding 
 按钮，CLI 的 `mute` 对它们也无效。VPS 侧要禁用某类告警去改
 `deploy/vps_monitor.py` 的硬规则。
 
+## 卸载（PC 侧）
+
+双击 `uninstall.bat`（或 `python uninstall.py`），交互确认输入 `yes` 后依次：
+
+1. 停止全部 FxxkPush 服务进程（按命令行匹配 `fuckpush/pc`，不动其它 pythonw）
+2. 删除 HKCU Run 的 6 个 `FuckPush_*` 自启项（含 StartupApproved 残留）
+3. 把挪到屏外的聊天窗口拉回屏内（`vision_listener unpark`）
+
+数据默认**保留**（`fp.config.json`、日志、状态），重装直接再跑 `setup.bat`；
+确定不要了加 `--purge` 连配置（含密钥）与运行数据一并删除（不可恢复，需输入
+`purge` 二次确认）。`--dry-run` 只打印将执行的动作；`--yes` 免确认供脚本化。
+VPS 侧不受影响，如需停用：`systemctl disable --now fuckpush-monitor ntfy`。
+
 ## 配置文件（不入库，自建）
 
 | 文件 | 内容 |
@@ -343,7 +356,8 @@ curl.exe -H "Authorization: Bearer $((Get-Content fp.config.json -Raw -Encoding 
 - [x] v0.4.0：误判反馈闭环（`pc/core/fp_feedback.py`）—— 手机端 👍/👎 按钮 → `fp-feedback` → 反馈归档含内容快照 → 源级规则自动纠正（3 次误判自动静默并跳过 AI，👍 可撤销），闭合「推送 → 人肉判定 → 规则纠正 → 少推」这一环
 - [x] v0.5.0：P2 留档清仓（告警中文化、告警合并与恢复重试、视觉采集三态与直推、通知权限定时复查、告警三层降级、fp-vps 通道 fail-open、state 形状校验与原子写、夜间分段心跳）+ PC 侧分包重组（`pc/services`·`pc/core`·`pc/bootstrap`，一次性碎片归并，视觉监听更名 `vision_listener.py`）+ 配置示例脱敏
 - [x] v0.6.0：单一配置重构（仓库根 fp.config.json + pc/core/fpconfig.py 读取器，11 个消费方迁移、四份旧配置删除）+ vision 配置驱动（process/class/title 三层匹配与 settings 运行参数块）+ 自定义软件接入（apps 声明式分诊规则，闸门与视觉双通道消费）+ 发布脱敏与 README 基于 ntfy 声明
-- [ ] v0.7.0：视觉截图瘦身与留档 —— 企微全尺寸截图（1233×813 ≈ 132KB/张，微信 544×519 ≈ 45KB）识别前降采样，降低上传体积与识别成本；截图落盘并滚动保留 24 小时，清理时机 = 重新开机时 + 每日凌晨
+- [x] v0.7.0：一键上手与稳定性加固 —— 注册自启动单文件（按当前目录探测项目根）+ 双侧一键（VPS `deploy/setup_vps.sh`、PC `setup.bat`/`setup.py` 向导与 `--check`）+ 一键卸载（`uninstall.bat`：停服务 / 摘自启 / 窗口归位，数据默认保留，`--purge` 全清）+ 运行测试与全链路审查共 20 处修复（P0 SSH 兜底鉴权、硬规则入重发队列、配置 mtime 热加载、非 200 留 ERROR 等）
+- [ ] v0.8.0：视觉截图瘦身与留档 —— 企微全尺寸截图（1233×813 ≈ 132KB/张，微信 544×519 ≈ 45KB）识别前降采样，降低上传体积与识别成本；截图落盘并滚动保留 24 小时，清理时机 = 重新开机时 + 每日凌晨
 - [ ] 钉钉 / 学习通等更多 App 深度适配
 - [ ] 每日日报（AI 汇总当天事件/误判，22:00 推手机；`fp_feedback.stats()` 已备好误判统计）
 - [ ] 误判样本 → 27B 模型微调（语料已在 `pc/feedback.jsonl` 自包含落地，缺训练流程）
