@@ -214,11 +214,8 @@ def _default_vision(my_name: str) -> dict:
             "min_w": 500, "enabled": True, "label": "企业微信",
             "prompt_hint": "左侧为会话列表，红色数字气泡为未读",
         },
-        "qq": {
-            "process": "QQ.exe", "class": None, "title": None,
-            "min_w": 400, "enabled": True, "label": "QQ",
-            "prompt_hint": "左侧为会话列表，红色气泡为未读",
-        },
+        # QQ 不进视觉清单：QQ 走 Windows toast 主通道（秒级），窗口最小化到
+        # 托盘时视觉侧会误报「采集停摆」。QQ 的分诊规则在 fp.config apps 块。
     }
 
 

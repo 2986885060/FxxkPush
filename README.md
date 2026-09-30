@@ -70,7 +70,7 @@ pc/
 | 来源 | 方式 | 实时性 |
 |---|---|---|
 | QQ / 钉钉 / 学习通等（走 Windows toast 的 App） | UserNotificationListener 抓系统通知 | 秒级实时 |
-| 自绘 UI、不走系统通知的应用（微信 / 企微 / QQ…，清单见 fp.config.json vision 块） | 窗口藏屏外，定时 PrintWindow 截图 → 云端/本地OCR模型视觉识别 | 30 分钟轮询 |
+| 自绘 UI、不走系统通知的应用（微信 / 企微…，清单见 fp.config.json vision 块） | 窗口藏屏外，定时 PrintWindow 截图 → 云端/本地OCR模型视觉识别 | 30 分钟轮询 |
 | VPS 日志 | journalctl 采集 + 硬规则 grep 判级 | 60 秒巡检 |
 
 微信/企业微信的视觉方案说明：这两个 App 的通知是自绘的、不走 Windows 通知中心，UIA 控件树也是黑盒。本项目的解法是把主窗口挪到屏幕外（保持可见不最小化），定时用 PrintWindow 离屏截图发给视觉模型识别——**全程无鼠标劫持、不挡屏幕、不影响操作电脑**。
@@ -190,8 +190,6 @@ uv pip install --python .venv httpx winotify paramiko winrt-runtime `
                   "dedup_ttl_sec": 21600, "offscreen_offset": 120 },
     "wechat": { "process": "Weixin.exe", "class": "Qt51514",
                 "title": null, "min_w": 400, "label": "微信",
-                "prompt_hint": "左侧为会话列表，红色气泡为未读" },
-    "qq":     { "process": "QQ.exe", "min_w": 400, "label": "QQ",
                 "prompt_hint": "左侧为会话列表，红色气泡为未读" }
   },
   "apps": {
@@ -333,7 +331,7 @@ VPS 侧不受影响，如需停用：`systemctl disable --now fuckpush-monitor n
 
 ## 已知边界
 
-- 微信/企业微信/QQ 消息推送有最长 30 分钟延迟（轮询间隔，用实时性换零打扰，`fp.config.json` vision 块的 `settings.poll_min` 全局可调，目标条目也可单独写 `poll_min`）
+- 微信/企业微信消息推送有最长 30 分钟延迟（视觉通道；QQ 走 toast 秒级）（轮询间隔，用实时性换零打扰，`fp.config.json` vision 块的 `settings.poll_min` 全局可调，目标条目也可单独写 `poll_min`）
 - 微信/企业微信窗口不能最小化到托盘（藏屏幕外可以），否则截图为空；重启电脑后窗口会回到屏内，双击「拖走聊天窗口.bat」归位（vision listener 每轮也会自动归位）
 - 屏幕缩放非 100% 时，操作窗口坐标的脚本**必须**先声明 DPI-aware，否则 `GetSystemMetrics` 返回虚拟化尺寸（125% 下 2048 而非物理 2560），算出的"屏幕外"位置会落在屏幕里
 - `pc_subscriber` 弹的 toast 会被 `notification_listener` 再抓一次（自己吃自己的尾巴），已用 `pc/toast_echo.jsonl` 指纹在 180 秒窗口内过滤
