@@ -354,7 +354,7 @@ VPS 侧不受影响，如需停用：`systemctl disable --now fuckpush-monitor n
 - [x] v0.4.0：误判反馈闭环（`pc/core/fp_feedback.py`）—— 手机端 👍/👎 按钮 → `fp-feedback` → 反馈归档含内容快照 → 源级规则自动纠正（3 次误判自动静默并跳过 AI，👍 可撤销），闭合「推送 → 人肉判定 → 规则纠正 → 少推」这一环
 - [x] v0.5.0：P2 留档清仓（告警中文化、告警合并与恢复重试、视觉采集三态与直推、通知权限定时复查、告警三层降级、fp-vps 通道 fail-open、state 形状校验与原子写、夜间分段心跳）+ PC 侧分包重组（`pc/services`·`pc/core`·`pc/bootstrap`，一次性碎片归并，视觉监听更名 `vision_listener.py`）+ 配置示例脱敏
 - [x] v0.6.0：单一配置重构（仓库根 fp.config.json + pc/core/fpconfig.py 读取器，11 个消费方迁移、四份旧配置删除）+ vision 配置驱动（process/class/title 三层匹配与 settings 运行参数块）+ 自定义软件接入（apps 声明式分诊规则，闸门与视觉双通道消费）+ 发布脱敏与 README 基于 ntfy 声明
-- [x] v0.7.0：一键上手与稳定性加固 —— 注册自启动单文件（按当前目录探测项目根）+ 双侧一键（VPS `deploy/setup_vps.sh`、PC `setup.bat`/`setup.py` 向导与 `--check`）+ 一键卸载（`uninstall.bat`：停服务 / 摘自启 / 窗口归位，数据默认保留，`--purge` 全清）+ 运行测试与全链路审查共 20 处修复（P0 SSH 兜底鉴权、硬规则入重发队列、配置 mtime 热加载、非 200 留 ERROR 等）
+- [x] v0.7.0：一键上手与稳定性加固 —— 注册自启动单文件（按当前目录探测项目根）+ 双侧一键（VPS `deploy/setup_vps.sh`、PC `setup.bat`/`setup.py` 向导与 `--check`）+ 一键卸载（`uninstall.bat`：停服务 / 摘自启 / 窗口归位，数据默认保留，`--purge` 全清）+ 取消 QQ 视觉适配（QQ 归 toast 主通道，消除最小化误报）+ 运行测试与全链路审查共 20 处修复（P0 SSH 兜底鉴权、硬规则入重发队列、配置 mtime 热加载、非 200 留 ERROR 等）
 - [ ] v0.8.0：视觉截图瘦身与留档 —— 企微全尺寸截图（1233×813 ≈ 132KB/张，微信 544×519 ≈ 45KB）识别前降采样，降低上传体积与识别成本；截图落盘并滚动保留 24 小时，清理时机 = 重新开机时 + 每日凌晨
 - [ ] 钉钉 / 学习通等更多 App 深度适配
 - [ ] 每日日报（AI 汇总当天事件/误判，22:00 推手机；`fp_feedback.stats()` 已备好误判统计）
